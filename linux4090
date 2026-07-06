@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$ROOT/vm-helper.env" ]]; then
+  source "$ROOT/vm-helper.env"
+fi
+
+VM="${VM:-win11-basic}"
+URI="${URI:-qemu:///system}"
+SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-300}"
+if ! declare -p GPU_PCI >/dev/null 2>&1; then
+  GPU_PCI=("0000:01:00.0" "0000:01:00.1")
+fi
+if ! declare -p GPU_NODE >/dev/null 2>&1; then
+  GPU_NODE=("pci_0000_01_00_0" "pci_0000_01_00_1")
+fi
+
+log() {
+  printf '[linux4090] %s\n' "$*"
+}
+
+die() {
+  printf '[linux4090] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+as_root() {
+  if (( EUID == 0 )); then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+domstate() {
+  virsh -c "$URI" domstate "$VM" 2>/dev/null || true
+}
+
+wait_for_vm_stop() {
+  local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    case "$(domstate)" in
+      "shut off"|"") return 0 ;;
+    esac
+    sleep 2
+  done
+  return 1
+}
+
+driver_for() {
+  local pci="$1"
+  local link="/sys/bus/pci/devices/$pci/driver"
+  if [[ -L "$link" ]]; then
+    basename "$(readlink -f "$link")"
+  else
+    printf 'none'
+  fi
+}
+
+need virsh
+need systemctl
+need modprobe
+need lspci
+
+state="$(domstate)"
+case "$state" in
+  running|paused|"in shutdown")
+    log "$VM is $state; requesting graceful ACPI shutdown."
+    virsh -c "$URI" shutdown "$VM" >/dev/null || true
+    if ! wait_for_vm_stop; then
+      die "$VM did not shut down within ${SHUTDOWN_TIMEOUT}s. Shut Windows down cleanly, or force it manually with: virsh -c $URI destroy $VM"
+    fi
+    log "$VM is shut off."
+    ;;
+  "shut off"|"")
+    log "$VM is already shut off."
+    ;;
+  *)
+    die "$VM is in unexpected state: $state"
+    ;;
+esac
+
+for node in "${GPU_NODE[@]}"; do
+  if virsh -c "$URI" nodedev-reattach "$node" >/dev/null 2>&1; then
+    log "reattached $node to host driver."
+  else
+    log "$node was already host-owned or did not need libvirt reattach."
+  fi
+done
+
+log "loading NVIDIA/audio host modules."
+as_root modprobe nvidia
+as_root modprobe nvidia_modeset
+as_root modprobe nvidia_uvm
+as_root modprobe nvidia_drm
+as_root modprobe snd_hda_intel
+
+for pci in "${GPU_PCI[@]}"; do
+  log "$pci driver: $(driver_for "$pci")"
+done
+
+if [[ "$(driver_for 0000:01:00.0)" == "vfio-pci" ]]; then
+  die "4090 GPU is still bound to vfio-pci; reboot or investigate before starting KDE."
+fi
+
+log "starting display-manager."
+as_root systemctl start display-manager
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  log "nvidia-smi summary:"
+  nvidia-smi --query-gpu=name,driver_version,display_active --format=csv,noheader 2>/dev/null || true
+fi
+
+log "Linux desktop path requested. If the login screen does not appear, switch TTY and check: systemctl status display-manager"

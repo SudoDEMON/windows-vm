@@ -1,0 +1,27 @@
+# Large/generated local artifacts
+downloads/
+evidence/
+*.iso
+*.qcow2
+*.img
+*.raw
+*.log
+*.ppm
+
+# Machine-local VM/runtime state
+vm-helper.env
+*.fd
+*.sfdisk
+*.sock
+*.pid
+
+# Local AI/session context
+project-memory.md
+project-journal.md
+.shared-agent-context-include
+.codex/
+.grok/
+
+# Editor/OS noise
+.DS_Store
+*~

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$ROOT/vm-helper.env" ]]; then
+  source "$ROOT/vm-helper.env"
+fi
+VM="${VM:-win11-basic}"
+
+usage() {
+  cat <<'EOF'
+Usage: usb-vm-helper <command> [vm-name]
+
+Commands:
+  status      Show VM USB devices and relevant Linux input devices.
+  to-vm       Attach the configured Windows USB devices live.
+  to-linux    Detach the configured Windows USB devices live.
+  help        Show this help.
+
+Environment:
+  VM          Default VM name when [vm-name] is omitted. Defaults to win11-basic.
+EOF
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  status)
+    exec "$ROOT/scripts/win-input-status.sh" "${2:-$VM}"
+    ;;
+  to-vm|attach)
+    exec "$ROOT/scripts/win-input-to-vm.sh" "${2:-$VM}"
+    ;;
+  to-linux|detach)
+    exec "$ROOT/scripts/win-input-to-linux.sh" "${2:-$VM}"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

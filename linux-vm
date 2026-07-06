@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$ROOT/vm-helper.env" ]]; then
+  source "$ROOT/vm-helper.env"
+fi
+
+VM="${VM:-win11-basic}"
+URI="${URI:-qemu:///system}"
+READY_DELAY="${READY_DELAY:-8}"
+if ! declare -p GPU_PCI >/dev/null 2>&1; then
+  GPU_PCI=("0000:01:00.0" "0000:01:00.1")
+fi
+
+log() {
+  printf '[linux-vm] %s\n' "$*"
+}
+
+die() {
+  printf '[linux-vm] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+as_root() {
+  if (( EUID == 0 )); then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+domstate() {
+  virsh -c "$URI" domstate "$VM" 2>/dev/null || true
+}
+
+driver_for() {
+  local pci="$1"
+  local link="/sys/bus/pci/devices/$pci/driver"
+  if [[ -L "$link" ]]; then
+    basename "$(readlink -f "$link")"
+  else
+    printf 'none'
+  fi
+}
+
+wait_for_running() {
+  for _ in {1..30}; do
+    [[ "$(domstate)" == "running" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_vfio() {
+  for _ in {1..30}; do
+    [[ "$(driver_for 0000:01:00.0)" == "vfio-pci" ]] && [[ "$(driver_for 0000:01:00.1)" == "vfio-pci" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+need virsh
+need systemctl
+need lspci
+need sudo
+
+state="$(domstate)"
+case "$state" in
+  running)
+    log "$VM is already running."
+    ;;
+  "shut off"|"")
+    log "$VM is shut off; starting Windows/4090 path first."
+    "$ROOT/windows4090"
+    ;;
+  *)
+    die "$VM is in state '$state'. Resolve that before starting the Linux+VM desktop mode."
+    ;;
+esac
+
+wait_for_running || die "$VM did not reach running state."
+wait_for_vfio || die "4090 did not bind fully to vfio-pci."
+
+for pci in "${GPU_PCI[@]}"; do
+  log "$pci driver: $(driver_for "$pci")"
+done
+
+if (( READY_DELAY > 0 )); then
+  log "waiting ${READY_DELAY}s before starting display-manager."
+  sleep "$READY_DELAY"
+fi
+
+if systemctl is-active --quiet display-manager; then
+  log "display-manager is already active."
+else
+  log "starting display-manager for Linux desktop on the iGPU."
+  as_root systemctl start display-manager
+fi
+
+log "mode ready: Windows VM owns the 4090, Linux display-manager is requested on the host/iGPU."
