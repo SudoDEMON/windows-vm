@@ -2,7 +2,8 @@
 set -euo pipefail
 
 VM="${1:-win11-basic}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 URI="qemu:///system"
 if [[ -f "$ROOT/vm-helper.env" ]]; then
   source "$ROOT/vm-helper.env"
