@@ -1,144 +1,116 @@
-# Windows VM 4090 Helpers
+# Interactive VM Helper
 
-Bash helpers for switching a Linux host and a Windows libvirt VM between RTX 4090 ownership modes.
+`vm-helper` is one interactive Bash tool for switching a Linux host and a libvirt VM around a passed-through GPU and USB devices. It replaces the former collection of host-specific scripts while retaining their familiar command names as symlinks.
 
-This repository is intentionally small and script-focused. It does not include VM images, disk snapshots, VirtIO ISOs, OVMF variables, TPM state, diagnostic logs, or local machine evidence.
+The tool does not create a Windows VM. The libvirt domain must already exist, and its selected GPU PCI functions must be persistent managed host devices. Both raw-block and file-backed VM disks are supported.
+
+## Start
+
+Launch the menu:
+
+```bash
+./vm-helper
+```
+
+The menu provides status, hardware discovery, configuration, GPU ownership modes, and live USB controls. Direct commands are also available:
+
+```bash
+./vm-helper linux
+./vm-helper windows
+./vm-helper linux-windows
+./vm-helper status
+./vm-helper check
+./vm-helper hardware
+./vm-helper configure
+./vm-helper usb status
+./vm-helper usb xml
+./vm-helper usb attach
+./vm-helper usb detach
+```
+
+`check` is a read-only transition preflight. It validates persistent PCI hostdev membership, PCI driver consistency, raw-disk safety, configured USB presence, and vendor GPU health without changing ownership.
+
+Legacy commands resolve to the same implementation:
+
+```bash
+./windows4090     # vm-helper windows
+./linux-vm        # vm-helper linux-windows
+./linuxvm         # vm-helper linux-windows
+./linux4090       # vm-helper linux
+./usb-vm-helper   # vm-helper usb ...
+./vm-gpu-manager  # compatibility name for vm-helper
+```
+
+## Dynamic Discovery
+
+The tool reads live host and libvirt state instead of assuming a 4090, fixed PCI addresses, CPU numbering, disk name, or USB set.
+
+- VM domains come from `virsh` and are auto-selected when only one exists.
+- GPU PCI functions come from display-class managed host devices in inactive VM XML, parsed with XPath.
+- The configuration wizard lists every display GPU, current driver, companion function in its IOMMU group, and IOMMU group number.
+- Host GPU modules are inferred for NVIDIA, AMD, and Intel devices.
+- CPU model/topology and current VM vCPU pinning are displayed from `lscpu` and `virsh vcpupin`.
+- Raw block disks are discovered from `virsh domblklist`; file-backed VMs skip raw-disk checks.
+- USB IDs come from persistent VM XML or an interactive scan of connected devices.
+- USB hostdev XML is generated at runtime, so static per-device XML files are unnecessary.
+
+With exactly one configured VM, read-only status works without `vm-helper.env`:
+
+```bash
+VM_MANAGER_CONFIG=/nonexistent ./vm-helper status
+```
+
+For multiple VMs or explicit hardware choices, run the interactive wizard:
+
+```bash
+./vm-helper configure
+```
+
+It writes ignored, mode-`0600` `vm-helper.env` and backs up an existing file before replacement. `vm-helper.env.example` documents every override. The former `REQUIRED_USB` array remains accepted for compatibility.
 
 ## Modes
 
-```bash
-./windows4090     # Start the Windows VM with the 4090; keep Linux at TTY
-./linux-vm        # Start/verify the Windows VM with the 4090, then start Linux display-manager on iGPU
-./linux4090       # Shut down the VM, return the 4090 to Linux, start display-manager
-./usb-vm-helper   # Inspect or live-toggle configured USB passthrough devices
-```
+`Windows` (`windows`) validates the VM, selected PCI hostdevs, disk, USB presence, GUI state, and PCI driver consistency. It stops the display manager, checks GPU users, safely unloads the NVIDIA stack when applicable, starts the VM, verifies every GPU function reached `vfio-pci`, and live-attaches configured USB devices. Linux remains at TTY.
 
-`linuxvm` is a compatibility alias for `linux-vm`.
+`Linux + Windows` (`linux-windows`, also `coexist` or `both`) performs the Windows transition, waits for readiness, then starts the Linux display manager on the remaining host GPU or iGPU.
 
-## Required Local Config
+`Linux` (`linux`) requests graceful guest shutdown, waits up to `SHUTDOWN_TIMEOUT`, and returns GPU functions to Linux. It never calls libvirt reattach for a function already owned by a Linux driver. Needed reattach operations are bounded, host modules are loaded, GPU health is verified, and only then is the display manager started.
 
-Copy the example config and edit it for the target machine:
+## Safety
 
-```bash
-cp vm-helper.env.example vm-helper.env
-```
+- Run GPU transitions from TTY or SSH. Graphical-session execution is rejected unless `ALLOW_GUI=1`.
+- A raw VM disk must exist, remain unmounted on Linux, and not report `offline`.
+- Every selected GPU function must already exist in the VM's persistent PCI hostdev configuration.
+- Missing configured USB devices stop VM startup before display-manager shutdown.
+- Inconsistent PCI state, including a stale uevent driver without a sysfs driver link, stops immediately with reboot guidance.
+- NVIDIA module unload failure is a hard stop before libvirt can partially detach a busy GPU.
+- Graceful guest shutdown is the default. The tool never calls `virsh destroy`.
 
-`vm-helper.env` is intentionally ignored by git because it should contain machine-local values such as:
+## Requirements
 
-- libvirt VM name
-- raw Windows disk `/dev/disk/by-id/...` path
-- GPU PCI function addresses
-- libvirt node-device names
-- USB vendor/product IDs expected for passthrough
+Required host commands:
 
-At minimum, set `WIN_DISK` to a stable `/dev/disk/by-id/...` path. Do not use `/dev/sdX` as a long-term config value because it can change across boots.
+- Bash 5+
+- `virsh` and a working system libvirt connection
+- `xmllint` from libxml2
+- `lspci`, `lscpu`, `lsblk`, `fuser`, `udevadm`, `modprobe`, `timeout`, and systemd
+- `lsusb` for the full hardware report
 
-## Default USB Set
-
-The example defaults expect these Windows USB passthrough devices:
-
-- Wooting 60HE keyboard: `31e3:1312`
-- Logitech G305 receiver: `046d:c53f`
-- SteelSeries Nova Pro Wireless: `1038:12e5`
-
-Adjust `REQUIRED_USB` in `vm-helper.env` for a different setup.
-
-## Quick Start
-
-From TTY or SSH:
-
-```bash
-./windows4090
-```
-
-To run the Windows VM and then start the Linux desktop on the iGPU:
-
-```bash
-./linux-vm
-```
-
-To cleanly return the machine to Linux owning the 4090:
-
-```bash
-./linux4090
-```
-
-USB passthrough helpers:
-
-```bash
-./usb-vm-helper status
-./usb-vm-helper to-vm
-./usb-vm-helper to-linux
-```
-
-## Host Assumptions
-
-The intended architecture is:
-
-- Linux desktop on the CPU/iGPU.
-- Windows VM display on the passed-through RTX 4090 physical output.
-- The Windows VM already exists in libvirt.
-- The 4090 GPU and its audio function are isolated enough for passthrough.
-- The Windows system disk is exposed to QEMU as a raw block device.
-
-The host can boot to TTY by default:
-
-```bash
-sudo systemctl set-default multi-user.target
-```
-
-Restore graphical boot:
-
-```bash
-sudo systemctl set-default graphical.target
-```
-
-## Safety Checks
-
-`windows4090` refuses to start if:
-
-- `WIN_DISK` is not configured.
-- the raw Windows disk is missing.
-- the raw Windows disk is mounted by Linux.
-- the raw Windows disk reports `offline`.
-- required USB devices are missing.
-- a graphical session is detected, unless `ALLOW_GUI=1`.
-- NVIDIA still has active users after stopping `display-manager`.
-
-`linux4090` requests graceful VM shutdown and waits before returning the 4090 to Linux.
+Firmware IOMMU support and suitable device isolation are still prerequisites. The Linux desktop should use another GPU or iGPU while the selected device belongs to the VM.
 
 ## Validation
 
-Syntax check:
-
 ```bash
-bash -n windows4090 linux4090 linux-vm linuxvm usb-vm-helper scripts/*.sh
+bash -n vm-helper vm-gpu-manager windows4090 linux4090 linux-vm linuxvm usb-vm-helper scripts/*.sh
+./vm-helper --help
+./vm-helper hardware
+./vm-helper status
+VM_MANAGER_CONFIG=/nonexistent ./vm-helper status
+git diff --check
 ```
 
-Inspect VM/GPU state:
-
-```bash
-virsh -c qemu:///system list --all
-lspci -nnk -s 01:00.0
-lspci -nnk -s 01:00.1
-```
-
-Expected GPU driver while Windows owns it:
-
-```text
-vfio-pci
-```
-
-Expected GPU driver after returning it to Linux:
-
-```text
-nvidia
-```
+The read-only commands are safe to run from a desktop. GPU and USB ownership commands intentionally mutate machine state and may require sudo.
 
 ## Handoff
 
-For another machine or another user, start with:
-
-- `docs/HANDOFF.md`
-- `vm-helper.env.example`
-- `CLAUDE.md` or `AGENTS.md`
+See `docs/HANDOFF.md` for adaptation and troubleshooting notes.

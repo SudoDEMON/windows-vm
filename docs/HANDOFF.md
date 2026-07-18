@@ -1,103 +1,65 @@
 # Handoff Notes
 
-This repository is a working helper set for a Linux host that can either use an RTX 4090 locally or pass it through to a Windows 11 libvirt VM.
+This repository now has one behavioral source: `vm-helper`. The former `vm-gpu-manager` name and all legacy commands are symlinks into it. Do not reintroduce separate transition logic into wrappers.
 
-The scripts are intentionally conservative and host-specific. They are a good starting point for a similar machine, but another host should review PCI IDs, USB IDs, display layout, VM name, and raw disk path before use.
+## First Run On Another Host
 
-For Claude users: `CLAUDE.md` contains agent-facing safety rules. For Codex or other agents, `AGENTS.md` contains the same repo-specific operating constraints.
+1. Enable IOMMU support in firmware and confirm the intended GPU has usable isolation.
+2. Install libvirt/QEMU, `virsh`, `xmllint`, PCI/USB utilities, and the host GPU driver.
+3. Define the VM and add the GPU functions as persistent managed PCI host devices.
+4. Run `./vm-helper hardware` to inspect CPU, GPUs, drivers, IOMMU groups, disks, and USB.
+5. Run `./vm-helper configure` to select the VM, GPU, raw disk if any, and USB devices.
+6. Review `./vm-helper status` before the first transition.
 
-## Modes
+When libvirt has exactly one domain with display-class PCI hostdevs, the tool can derive VM, GPU functions, USB hostdevs, and raw disk directly from inactive XML without a config file.
 
-- `./windows4090`: start the Windows VM with the RTX 4090 passed through and leave Linux at TTY.
-- `./linux-vm`: start or verify the Windows VM with the RTX 4090 passed through, then start the Linux display manager on the iGPU.
-- `./linux4090`: gracefully shut down the Windows VM, reattach the RTX 4090 to Linux, and start the Linux display manager.
-- `./usb-vm-helper`: show or live-toggle configured USB passthrough devices.
+## Configuration Contract
 
-## Local Configuration
+The local `vm-helper.env` is Bash syntax and intentionally ignored. The wizard creates it with mode `0600` and backs up an existing copy. Supported values are:
 
-The scripts have defaults for the original machine, but they will source `vm-helper.env` from the repo root when present. Keep that file untracked.
+- `VM`, `URI`: libvirt domain and connection.
+- `WIN_DISK`: optional stable raw block path; empty permits VM XML discovery or a file-backed VM.
+- `GPU_PCI`: selected GPU/companion PCI functions.
+- `GPU_MODULES`: modules needed when returning the GPU to Linux.
+- `USB_DEVICES`: `Label|vendor|product` entries.
+- `USB_AUTO_DISCOVER`: discover USB hostdevs from inactive VM XML when the array is empty.
+- transition timing and `ALLOW_GUI` values documented in `vm-helper.env.example`.
 
-Start from:
+Legacy `REQUIRED_USB` is mapped to `USB_DEVICES`. `GPU_NODE` is no longer needed because libvirt node names are derived from PCI addresses.
 
-```bash
-cp vm-helper.env.example vm-helper.env
-```
+## Operational Invariants
 
-Then edit values for the target host.
+- A selected GPU PCI function must exist both on the host and as a persistent VM PCI hostdev.
+- The raw block disk, when present, must be online and completely unmounted on Linux.
+- Configured USB devices must be connected before VM startup.
+- The display manager is stopped before handing the GPU to the VM.
+- Active GPU users and busy NVIDIA modules stop the transition.
+- Post-start verification requires every selected PCI function on `vfio-pci`.
+- Return-to-Linux skips libvirt reattach for devices already on a host driver. This prevents the fresh-boot reattach bug that can leave NVIDIA half-detached.
+- The display manager starts only after the returned GPU has a host driver and vendor health checks pass.
+- Guest shutdown remains graceful; no helper uses `virsh destroy`.
 
-Important values:
+## Vendor Behavior
 
-- `VM`: libvirt domain name.
-- `URI`: libvirt URI.
-- `WIN_DISK`: stable `/dev/disk/by-id/...` path for the Windows raw disk.
-- `REQUIRED_USB`: bash array of `Label|vendor|product` entries that must be present before starting the VM.
-- `GPU_PCI`: bash array of PCI addresses for the GPU and its audio function.
-- `GPU_NODE`: libvirt node-device names for host reattach.
+NVIDIA module handling is explicit because its DRM/UVM/modeset stack must be unloaded in dependency order before passthrough and reloaded in dependency order afterward. AMD and Intel host modules are inferred for return-to-Linux, but they are not globally unloaded before VM start because the same module may also own the host iGPU. For those vendors, libvirt performs per-device detach and reports a busy device normally.
 
-## Hardware Expectations
+## Troubleshooting
 
-The original setup uses:
-
-- Linux display on the CPU/iGPU.
-- Windows display on the RTX 4090 physical output.
-- Windows raw disk on an external USB-C NVMe.
-- Windows USB defaults:
-  - Wooting 60HE: `31e3:1312`
-  - Logitech G305 receiver: `046d:c53f`
-  - SteelSeries Nova Pro Wireless: `1038:12e5`
-
-The external NVMe path matters. If Linux reports the disk as `offline`, do not start the VM. Power-cycle or replug the enclosure first.
-
-## Preconditions
-
-The host needs:
-
-- IOMMU/SVM enabled in firmware.
-- iGPU enabled and usable by Linux.
-- RTX 4090 and NVIDIA audio in an isolated IOMMU group.
-- `qemu`, `libvirt`, OVMF, TPM support, and `virsh`.
-- A Windows VM already defined in libvirt.
-- The Linux display manager stopped before handing the 4090 to Windows.
-
-The original host boots to TTY by default:
+Use the read-only report first:
 
 ```bash
-sudo systemctl set-default multi-user.target
+./vm-helper status
+./vm-helper hardware
 ```
 
-To restore graphical boot:
+If PCI `uevent` names a driver but the device has no `driver` symlink, the device is partially transitioned. Reboot before another ownership command.
 
-```bash
-sudo systemctl set-default graphical.target
-```
+If an NVIDIA module cannot reload after a rolling-release update, compare the running kernel with `modinfo -F vermagic nvidia`; the tool prints these diagnostics on failure. A reboot into the matching kernel/module set is the normal recovery.
 
-## Validation Commands
+If VM startup reports a selected PCI function is not persistent, add that function to the inactive libvirt domain as a managed PCI hostdev before retrying.
 
-Before starting Windows:
+If USB attachment is ambiguous because multiple identical VID:PID devices are connected, use persistent VM XML with explicit USB source addressing or extend the local configuration model before relying on live VID:PID attachment.
 
-```bash
-lsblk -o NAME,MODEL,TRAN,SIZE,STATE,MOUNTPOINTS
-virsh -c qemu:///system domstate "$VM"
-lspci -nnk -s 01:00.0
-lspci -nnk -s 01:00.1
-```
+## Repository Hygiene
 
-While Windows owns the GPU:
-
-```bash
-lspci -nnk -s 01:00.0
-lspci -nnk -s 01:00.1
-virsh -c qemu:///system qemu-monitor-command "$VM" --hmp 'info usb'
-```
-
-Expected GPU driver while Windows owns it:
-
-```text
-vfio-pci
-```
-
-Expected GPU driver after `linux4090` returns it to Linux:
-
-```text
-nvidia
-```
+Do not commit `vm-helper.env`, evidence, VM images, ISOs, OVMF variables, TPM state, logs, project memory, or authentication/session data. The public repository should contain only the generic tool, symlink entrypoints, example config, and documentation.
