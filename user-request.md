@@ -10,6 +10,7 @@
 - [x] One regular executable, `vm-helper`, owns all behavior.
 - [x] Running `vm-helper` without arguments opens an interactive menu.
 - [x] The first three menu choices use the short labels `Linux`, `Windows`, and `Linux + Windows`.
+- [x] The menu supports Up/Down navigation with Enter as well as direct number selection.
 - [x] `~/vm-helper` resolves to the repository implementation.
 - [x] Direct CLI commands cover Windows-only, Windows plus Linux desktop, return-to-Linux, USB status/attach/detach, status, preflight, hardware discovery, and configuration.
 - [x] Legacy command names remain usable as symlinks into the unified implementation.

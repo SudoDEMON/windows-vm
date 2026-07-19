@@ -693,25 +693,75 @@ confirm() {
   [[ "$answer" =~ ^[Yy]$ ]]
 }
 
+read_main_menu_choice() {
+  local -a labels=(
+    'Linux'
+    'Windows'
+    'Linux + Windows'
+    'Status'
+    'Validate configuration'
+    'Discover hardware'
+    'USB status'
+    'USB -> Windows'
+    'USB -> Linux'
+    'Configure this host'
+    'Exit'
+  )
+  local -a values=(1 2 3 4 5 6 7 8 9 10 0)
+  local selected=0 key suffix next index
+
+  printf '\033[s'
+  while true; do
+    printf '\nVM Helper\n'
+    for index in "${!labels[@]}"; do
+      if ((index == selected)); then
+        printf ' \033[7m%2s) %s\033[0m\n' "${values[$index]}" "${labels[$index]}"
+      else
+        printf ' %2s) %s\n' "${values[$index]}" "${labels[$index]}"
+      fi
+    done
+    printf '\nUp/Down: navigate   Enter: select   Number: choose\n'
+
+    IFS= read -rsn1 key || return 1
+    case "$key" in
+      $'\e')
+        suffix=''
+        IFS= read -rsn2 -t 0.15 suffix || true
+        case "$suffix" in
+          '[A') selected=$(((selected - 1 + ${#labels[@]}) % ${#labels[@]})) ;;
+          '[B') selected=$(((selected + 1) % ${#labels[@]})) ;;
+          *) continue ;;
+        esac
+        ;;
+      '')
+        MENU_CHOICE="${values[$selected]}"
+        return 0
+        ;;
+      [0-9])
+        MENU_CHOICE="$key"
+        next=''
+        if IFS= read -rsn1 -t 0.35 next; then
+          if [[ "$key" == 1 && "$next" == 0 ]]; then
+            MENU_CHOICE=10
+            IFS= read -rsn1 -t 0.35 next || true
+          fi
+        fi
+        return 0
+        ;;
+      k) selected=$(((selected - 1 + ${#labels[@]}) % ${#labels[@]})) ;;
+      j) selected=$(((selected + 1) % ${#labels[@]})) ;;
+      *) continue ;;
+    esac
+    printf '\033[u\033[J'
+  done
+}
+
 interactive_menu() {
   local choice
   while true; do
-    cat <<'EOF'
-
-VM Helper
-  1) Linux
-  2) Windows
-  3) Linux + Windows
-  4) Status
-  5) Validate configuration
-  6) Discover hardware
-  7) USB status
-  8) USB -> Windows
-  9) USB -> Linux
- 10) Configure this host
-  0) Exit
-EOF
-    read -rp 'Selection: ' choice
+    read_main_menu_choice || return 0
+    choice="$MENU_CHOICE"
+    printf '\n'
     case "$choice" in
       1) confirm 'Shut down the VM, return its devices to Linux, and start the desktop?' && (return_linux_mode) || true ;;
       2) confirm 'Start Windows with the selected devices and leave Linux at TTY?' && (start_windows_mode) || true ;;

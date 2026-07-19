@@ -12,7 +12,7 @@ Launch the menu:
 ./vm-helper
 ```
 
-The menu provides status, hardware discovery, configuration, GPU ownership modes, and live USB controls. Direct commands are also available:
+Use Up/Down and Enter to navigate the menu, or press an option number directly. The menu provides status, hardware discovery, configuration, GPU ownership modes, and live USB controls. Direct commands are also available:
 
 ```bash
 ./vm-helper linux
