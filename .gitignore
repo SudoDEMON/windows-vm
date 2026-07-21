@@ -21,6 +21,7 @@ vm-helper.env.bak.*
 project-memory.md
 project-journal.md
 project.grok
+user-request.md
 .shared-agent-context-include
 AGENTS.md
 AGENT.md
