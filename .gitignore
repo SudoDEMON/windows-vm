@@ -10,6 +10,8 @@ evidence/
 
 # Machine-local VM/runtime state
 vm-helper.env
+vm-helper.env.bak.*
+.vm-helper.env.*
 *.fd
 *.sfdisk
 *.sock
@@ -18,9 +20,19 @@ vm-helper.env
 # Local AI/session context
 project-memory.md
 project-journal.md
+project.grok
 .shared-agent-context-include
+AGENTS.md
+AGENT.md
+CLAUDE.md
+GEMINI.md
+MEMORY.md
 .codex/
 .grok/
+.codex-scratch/
+.grok-scratch/
+*.codex-tmp
+*.grok-tmp
 
 # Editor/OS noise
 .DS_Store

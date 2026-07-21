@@ -8,7 +8,7 @@ This repository now has one behavioral source: `vm-helper`. The former `vm-gpu-m
 2. Install libvirt/QEMU, `virsh`, `xmllint`, PCI/USB utilities, and the host GPU driver.
 3. Define the VM and add the GPU functions as persistent managed PCI host devices.
 4. Run `./vm-helper hardware` to inspect CPU, GPUs, drivers, IOMMU groups, disks, and USB.
-5. Run `./vm-helper configure` to select the VM, GPU, raw disk if any, and USB devices.
+5. Run `./vm-helper configure` to select the VM, GPU, and USB devices and review the VM's attached raw disks.
 6. Review `./vm-helper status` before the first transition.
 
 When libvirt has exactly one domain with display-class PCI hostdevs, the tool can derive VM, GPU functions, USB hostdevs, and raw disk directly from inactive XML without a config file.
@@ -18,7 +18,7 @@ When libvirt has exactly one domain with display-class PCI hostdevs, the tool ca
 The local `vm-helper.env` is Bash syntax and intentionally ignored. The wizard creates it with mode `0600` and backs up an existing copy. Supported values are:
 
 - `VM`, `URI`: libvirt domain and connection.
-- `WIN_DISK`: optional stable raw block path; empty permits VM XML discovery or a file-backed VM.
+- `WIN_DISK`: optional stable expected raw block path; when set, it must resolve to a raw disk already attached in inactive VM XML. Every attached raw disk is checked regardless.
 - `GPU_PCI`: selected GPU/companion PCI functions.
 - `GPU_MODULES`: modules needed when returning the GPU to Linux.
 - `USB_DEVICES`: `Label|vendor|product` entries.
@@ -30,12 +30,13 @@ Legacy `REQUIRED_USB` is mapped to `USB_DEVICES`. `GPU_NODE` is no longer needed
 ## Operational Invariants
 
 - A selected GPU PCI function must exist both on the host and as a persistent VM PCI hostdev.
-- The raw block disk, when present, must be online and completely unmounted on Linux.
+- Every attached raw block disk must be online and completely unmounted on Linux.
 - Configured USB devices must be connected before VM startup.
 - The display manager is stopped before handing the GPU to the VM.
 - Active GPU users and busy NVIDIA modules stop the transition.
 - Post-start verification requires every selected PCI function on `vfio-pci`.
 - Return-to-Linux skips libvirt reattach for devices already on a host driver. This prevents the fresh-boot reattach bug that can leave NVIDIA half-detached.
+- Return-to-Linux refuses to start the display manager while any selected function remains on `vfio-pci`.
 - The display manager starts only after the returned GPU has a host driver and vendor health checks pass.
 - Guest shutdown remains graceful; no helper uses `virsh destroy`.
 
@@ -62,4 +63,4 @@ If USB attachment is ambiguous because multiple identical VID:PID devices are co
 
 ## Repository Hygiene
 
-Do not commit `vm-helper.env`, evidence, VM images, ISOs, OVMF variables, TPM state, logs, project memory, or authentication/session data. The public repository should contain only the generic tool, symlink entrypoints, example config, and documentation.
+Do not commit `vm-helper.env` or its backups, evidence, VM images, ISOs, OVMF variables, TPM state, logs, project memory, project-specific agent instructions, or authentication/session data. The public repository should contain only the generic tool, symlink entrypoints, example config, and documentation.

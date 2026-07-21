@@ -30,6 +30,7 @@ fi
 
 VM_XML=""
 TEMP_FILES=()
+VM_RAW_DISKS=()
 
 cleanup() {
   ((${#TEMP_FILES[@]} == 0)) || rm -f -- "${TEMP_FILES[@]}"
@@ -47,7 +48,14 @@ as_root() {
 }
 
 domstate() {
-  virsh -c "$URI" domstate "$VM" 2>/dev/null || true
+  virsh -c "$URI" domstate "$VM" 2>/dev/null
+}
+
+required_domstate() {
+  local state
+  state="$(domstate)" || die "could not read state for $VM at $URI"
+  [[ -n "$state" ]] || die "libvirt returned an empty state for $VM at $URI"
+  printf '%s' "$state"
 }
 
 driver_for() {
@@ -96,9 +104,16 @@ usb_present() {
 }
 
 resolve_vm() {
+  local output
   local -a domains=()
-  if [[ -n "$VM" ]] && virsh -c "$URI" dominfo "$VM" >/dev/null 2>&1; then return 0; fi
-  mapfile -t domains < <(virsh -c "$URI" list --all --name | awk 'NF')
+  if [[ -n "$VM" ]]; then
+    virsh -c "$URI" dominfo "$VM" >/dev/null 2>&1 \
+      || die "configured VM '$VM' was not found at $URI"
+    return 0
+  fi
+  output="$(virsh -c "$URI" list --all --name)" \
+    || die "could not list libvirt domains at $URI"
+  mapfile -t domains < <(awk 'NF' <<<"$output")
   if ((${#domains[@]} == 1)); then
     VM="${domains[0]}"
     log "auto-selected the only libvirt domain: $VM"
@@ -150,9 +165,31 @@ discover_usb_from_vm() {
   done
 }
 
-discover_disk_from_vm() {
-  virsh -c "$URI" domblklist "$VM" --details 2>/dev/null \
-    | awk '$1 == "block" && $2 == "disk" && !found {value=$4; found=1} END {if (found) print value}'
+discover_disks_from_vm() {
+  local count index disk
+  VM_RAW_DISKS=()
+  count="$(xml_count "/domain/devices/disk[@type='block' and @device='disk']/source[@dev]")"
+  for ((index=1; index<=count; index++)); do
+    disk="$(xml_value "(/domain/devices/disk[@type='block' and @device='disk']/source[@dev])[$index]/@dev")"
+    [[ -n "$disk" ]] && VM_RAW_DISKS+=("$disk")
+  done
+}
+
+same_device_path() {
+  local left="$1" right="$2" left_real right_real
+  [[ "$left" == "$right" ]] && return 0
+  left_real="$(readlink -f -- "$left" 2>/dev/null || true)"
+  right_real="$(readlink -f -- "$right" 2>/dev/null || true)"
+  [[ -n "$left_real" && "$left_real" == "$right_real" ]]
+}
+
+validate_configured_disk() {
+  local disk matched=0
+  [[ -n "$WIN_DISK" ]] || return 0
+  for disk in "${VM_RAW_DISKS[@]}"; do
+    same_device_path "$WIN_DISK" "$disk" && matched=1
+  done
+  ((matched == 1)) || die "configured WIN_DISK is not a raw block disk attached to $VM: $WIN_DISK"
 }
 
 infer_gpu_modules() {
@@ -180,7 +217,10 @@ load_runtime_config() {
   local pci
   need virsh; need xmllint; need lspci
   resolve_vm
-  VM_XML="$(virsh -c "$URI" dumpxml --inactive "$VM")"
+  VM_XML="$(virsh -c "$URI" dumpxml --inactive "$VM")" \
+    || die "could not read inactive XML for $VM at $URI"
+  discover_disks_from_vm
+  validate_configured_disk
   ((${#GPU_PCI[@]} > 0)) || discover_gpu_from_vm
   ((${#GPU_PCI[@]} > 0)) || die "no passed-through display GPU was discovered for $VM; run '$SCRIPT_PATH configure'"
   for pci in "${GPU_PCI[@]}"; do
@@ -189,7 +229,7 @@ load_runtime_config() {
   done
   ((${#GPU_MODULES[@]} > 0)) || infer_gpu_modules
   if ((${#USB_DEVICES[@]} == 0)) && [[ "$USB_AUTO_DISCOVER" == "1" ]]; then discover_usb_from_vm; fi
-  [[ -n "$WIN_DISK" ]] || WIN_DISK="$(discover_disk_from_vm)"
+  [[ -n "$WIN_DISK" ]] || WIN_DISK="${VM_RAW_DISKS[0]:-}"
 }
 
 vm_has_pci_hostdev() {
@@ -213,20 +253,22 @@ assert_pci_state_sane() {
   fi
 }
 
-check_raw_disk() {
-  local diskdev state mounted
-  if [[ -z "$WIN_DISK" ]]; then
+check_raw_disks() {
+  local disk diskdev state mounted
+  if ((${#VM_RAW_DISKS[@]} == 0)); then
     log "$VM has no raw block disk; raw-disk safety checks are not needed."
     return 0
   fi
-  [[ -e "$WIN_DISK" ]] || die "VM raw disk is missing: $WIN_DISK"
-  diskdev="$(readlink -f "$WIN_DISK")"
-  [[ -b "$diskdev" ]] || die "raw disk did not resolve to a block device: $WIN_DISK -> $diskdev"
-  state="$(lsblk -dnro STATE "$diskdev" 2>/dev/null | awk 'NF && !found {value=$0; found=1} END {if (found) print value}')"
-  [[ "$state" != "offline" ]] || die "raw disk is offline: $diskdev"
-  mounted="$(lsblk -nrpo NAME,MOUNTPOINT "$diskdev" | awk '$2 != ""')"
-  [[ -z "$mounted" ]] || { printf '%s\n' "$mounted" >&2; die "raw disk or a partition is mounted on Linux"; }
-  log "raw disk is present and unmounted: $diskdev"
+  for disk in "${VM_RAW_DISKS[@]}"; do
+    [[ -e "$disk" ]] || die "VM raw disk is missing: $disk"
+    diskdev="$(readlink -f -- "$disk")"
+    [[ -b "$diskdev" ]] || die "raw disk did not resolve to a block device: $disk -> $diskdev"
+    state="$(lsblk -dnro STATE "$diskdev" 2>/dev/null | awk 'NF && !found {value=$0; found=1} END {if (found) print value}')"
+    [[ "$state" != "offline" ]] || die "raw disk is offline: $diskdev"
+    mounted="$(lsblk -nrpo NAME,MOUNTPOINT "$diskdev" | awk '$2 != ""')"
+    [[ -z "$mounted" ]] || { printf '%s\n' "$mounted" >&2; die "raw disk or a partition is mounted on Linux"; }
+    log "raw disk is present and unmounted: $diskdev"
+  done
 }
 
 check_usb_devices() {
@@ -352,8 +394,12 @@ show_linux_input_devices() {
 }
 
 wait_for_state() {
-  local wanted="$1" timeout_seconds="$2" deadline=$((SECONDS + timeout_seconds))
-  while ((SECONDS < deadline)); do [[ "$(domstate)" == "$wanted" ]] && return 0; sleep 1; done
+  local wanted="$1" timeout_seconds="$2" deadline=$((SECONDS + timeout_seconds)) state
+  while ((SECONDS < deadline)); do
+    state="$(domstate)" || return 1
+    [[ "$state" == "$wanted" ]] && return 0
+    sleep 1
+  done
   return 1
 }
 
@@ -371,19 +417,19 @@ wait_for_vfio() {
 start_windows_mode() {
   local state users pci
   load_runtime_config
-  state="$(domstate)"
-  [[ "$state" == "shut off" || -z "$state" ]] || die "$VM is already $state"
+  state="$(required_domstate)"
+  [[ "$state" == "shut off" ]] || die "$VM is already $state"
   for pci in "${GPU_PCI[@]}"; do
     vm_has_pci_hostdev "$pci" || die "$pci is not a persistent PCI host device in $VM"
     assert_pci_state_sane "$pci"
   done
-  check_raw_disk; check_usb_devices
+  check_raw_disks; check_usb_devices
   if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" && "$ALLOW_GUI" != "1" ]]; then
     die "graphical session detected; run from TTY/SSH or explicitly set ALLOW_GUI=1"
   fi
   if systemctl is-active --quiet display-manager.service; then
     log "stopping display-manager to release the selected GPU"
-    as_root systemctl stop display-manager.service
+    as_root systemctl stop display-manager.service || die "failed to stop display-manager"
   else log "display-manager is already inactive"; fi
   sleep 2
   if [[ "$(driver_for "${GPU_PCI[0]}")" == "nvidia" ]]; then verify_nvidia; fi
@@ -392,9 +438,12 @@ start_windows_mode() {
   unload_gpu_modules
   for pci in "${GPU_PCI[@]}"; do log "$pci pre-start driver: $(driver_for "$pci")"; done
   log "starting $VM"
-  virsh -c "$URI" start "$VM"
-  wait_for_state running 30 || die "$VM did not reach running state"
-  wait_for_vfio || die "not every selected GPU function reached vfio-pci"
+  virsh -c "$URI" start "$VM" \
+    || die "failed to start $VM; run '$SCRIPT_PATH linux' to restore the host desktop"
+  wait_for_state running 30 \
+    || die "$VM did not reach running state; run '$SCRIPT_PATH linux' to restore the host desktop"
+  wait_for_vfio \
+    || die "not every selected GPU function reached vfio-pci; run '$SCRIPT_PATH linux' to restore the host desktop"
   for pci in "${GPU_PCI[@]}"; do log "$pci VM driver: $(driver_for "$pci")"; done
   ((${#USB_DEVICES[@]} == 0)) || usb_action attach
   log "$VM is running with the selected GPU"
@@ -403,10 +452,10 @@ start_windows_mode() {
 start_coexist_mode() {
   local state pci
   load_runtime_config
-  state="$(domstate)"
+  state="$(required_domstate)"
   case "$state" in
     running) log "$VM is already running" ;;
-    "shut off"|"") start_windows_mode ;;
+    "shut off") start_windows_mode ;;
     *) die "$VM is $state" ;;
   esac
   wait_for_vfio || die "not every selected GPU function is on vfio-pci"
@@ -414,7 +463,7 @@ start_coexist_mode() {
   if ((READY_DELAY > 0)); then log "waiting ${READY_DELAY}s before starting display-manager"; sleep "$READY_DELAY"; fi
   if ! systemctl is-active --quiet display-manager.service; then
     log "starting Linux display-manager on the remaining host GPU"
-    as_root systemctl start display-manager.service
+    as_root systemctl start display-manager.service || die "failed to start display-manager"
   fi
   log "Linux + Windows ready: $VM owns the selected GPU and Linux desktop is active"
 }
@@ -435,28 +484,33 @@ reattach_if_needed() {
 }
 
 return_linux_mode() {
-  local state pci primary_driver
+  local state pci driver primary_driver
   load_runtime_config
-  state="$(domstate)"
+  state="$(required_domstate)"
   case "$state" in
     running|paused|"in shutdown")
       log "$VM is $state; requesting graceful ACPI shutdown"
-      virsh -c "$URI" shutdown "$VM" >/dev/null || true
+      virsh -c "$URI" shutdown "$VM" >/dev/null || die "failed to request graceful shutdown for $VM"
       wait_for_state "shut off" "$SHUTDOWN_TIMEOUT" || die "$VM did not shut down within ${SHUTDOWN_TIMEOUT}s"
       ;;
-    "shut off"|"") log "$VM is already shut off" ;;
+    "shut off") log "$VM is already shut off" ;;
     *) die "$VM is in unexpected state: $state" ;;
   esac
   for pci in "${GPU_PCI[@]}"; do assert_pci_state_sane "$pci"; done
   for pci in "${GPU_PCI[@]}"; do reattach_if_needed "$pci"; done
   load_gpu_modules
-  for pci in "${GPU_PCI[@]}"; do log "$pci Linux driver: $(driver_for "$pci")"; done
+  for pci in "${GPU_PCI[@]}"; do
+    driver="$(driver_for "$pci")"
+    log "$pci Linux driver: $driver"
+    [[ "$driver" != "vfio-pci" ]] || die "$pci is still on vfio-pci; refusing to start the desktop"
+  done
   primary_driver="$(driver_for "${GPU_PCI[0]}")"
   [[ "$primary_driver" != "vfio-pci" && "$primary_driver" != "none" ]] \
     || die "selected GPU is still $primary_driver; refusing to start the desktop"
   verify_nvidia
   log "starting display-manager"
-  as_root systemctl start display-manager.service
+  as_root systemctl start display-manager.service || die "failed to start display-manager"
+  systemctl is-active --quiet display-manager.service || die "display-manager did not become active"
   log "Linux mode ready"
 }
 
@@ -469,11 +523,19 @@ usb_xml_file() {
     '  </source>' '</hostdev>' >"$USB_XML_FILE"
 }
 
+usb_live_count() {
+  local vid="${1,,}" pid="${2,,}" live_xml
+  live_xml="$(virsh -c "$URI" dumpxml "$VM")" || die "could not read live XML for $VM"
+  xmllint --xpath \
+    "count(/domain/devices/hostdev[@type='usb']/source[vendor/@id='0x$vid' and product/@id='0x$pid'])" \
+    - 2>/dev/null <<<"$live_xml" || printf '0'
+}
+
 usb_action() {
-  local action="$1" state item label vid pid file
+  local action="$1" state item label vid pid file count output
   [[ "$action" =~ ^(status|xml|attach|detach)$ ]] || die "unknown USB action: $action"
   load_runtime_config
-  state="$(domstate)"
+  state="$(required_domstate)"
   if [[ "$action" == "status" ]]; then
     printf 'VM: %s (%s)\n' "$VM" "${state:-unknown}"
     for item in "${USB_DEVICES[@]}"; do
@@ -497,12 +559,26 @@ usb_action() {
     IFS='|' read -r label vid pid <<<"$item"; usb_xml_file "$vid" "$pid"; file="$USB_XML_FILE"
     case "$action" in
       attach)
-        if virsh -c "$URI" attach-device "$VM" "$file" --live >/dev/null 2>&1; then log "attached $label"
-        else log "$label may already be attached"; fi
+        count="$(usb_live_count "$vid" "$pid")"
+        if ((count > 0)); then
+          log "$label is already attached"
+        elif output="$(virsh -c "$URI" attach-device "$VM" "$file" --live 2>&1)"; then
+          log "attached $label"
+        else
+          [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+          die "failed to attach $label ($vid:$pid)"
+        fi
         ;;
       detach)
-        if virsh -c "$URI" detach-device "$VM" "$file" --live >/dev/null 2>&1; then log "detached $label"
-        else log "$label was not attached"; fi
+        count="$(usb_live_count "$vid" "$pid")"
+        if ((count == 0)); then
+          log "$label is not attached"
+        elif output="$(virsh -c "$URI" detach-device "$VM" "$file" --live 2>&1)"; then
+          log "detached $label"
+        else
+          [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+          die "failed to detach $label ($vid:$pid)"
+        fi
         ;;
     esac
   done
@@ -526,9 +602,11 @@ hardware_report() {
 
 status_report() {
   local pci item label vid pid state
-  load_runtime_config; state="$(domstate)"
+  load_runtime_config; state="$(required_domstate)"
   printf 'VM: %s\nState: %s\nURI: %s\n' "$VM" "${state:-unknown}" "$URI"
-  printf 'Raw disk: %s\n' "${WIN_DISK:-none (file-backed or undiscovered)}"
+  printf 'Raw disks:\n'
+  if ((${#VM_RAW_DISKS[@]} == 0)); then printf '  none (file-backed VM)\n'; fi
+  for item in "${VM_RAW_DISKS[@]}"; do printf '  %s\n' "$item"; done
   printf 'Display manager: %s\n' "$(systemctl is-active display-manager.service 2>/dev/null || true)"
   printf '\nSelected GPU functions:\n'
   for pci in "${GPU_PCI[@]}"; do
@@ -548,14 +626,14 @@ status_report() {
 
 preflight_report() {
   local state pci
-  load_runtime_config; state="$(domstate)"
-  [[ "$state" == "shut off" || -z "$state" ]] || die "$VM is $state; preflight expects a stopped VM"
+  load_runtime_config; state="$(required_domstate)"
+  [[ "$state" == "shut off" ]] || die "$VM is $state; preflight expects a stopped VM"
   for pci in "${GPU_PCI[@]}"; do
     vm_has_pci_hostdev "$pci" || die "$pci is not a persistent PCI host device in $VM"
     assert_pci_state_sane "$pci"
     log "$pci is persistent and driver state is consistent ($(driver_for "$pci"))"
   done
-  check_raw_disk
+  check_raw_disks
   check_usb_devices
   warn_if_nvidia_modules_updated_since_boot
   [[ "$(driver_for "${GPU_PCI[0]}")" != "nvidia" ]] || verify_nvidia
@@ -593,14 +671,15 @@ write_config() {
 }
 
 configure_interactive() {
-  local -a domains=() labels=() bdfs=() disks=() disk_labels=() usb_items=() usb_labels=()
-  local -a disk_targets=()
-  local dev bdf class slot group answer selection item vid pid label disk target current_disk persistent seen_usb='|'
+  local -a domains=() labels=() bdfs=() usb_items=() usb_labels=()
+  local dev bdf class slot group answer selection item vid pid label output persistent seen_usb='|'
   [[ -t 0 ]] || die "configure requires an interactive terminal"
-  need virsh; need xmllint; need lspci; need lscpu; need lsblk
-  mapfile -t domains < <(virsh -c "$URI" list --all --name | awk 'NF')
+  need virsh; need xmllint; need lspci; need lscpu
+  output="$(virsh -c "$URI" list --all --name)" || die "could not list libvirt domains at $URI"
+  mapfile -t domains < <(awk 'NF' <<<"$output")
   choose_one 'Select the libvirt VM:' "${domains[@]}"; VM="${domains[$CHOICE_INDEX]}"
-  VM_XML="$(virsh -c "$URI" dumpxml --inactive "$VM")"
+  VM_XML="$(virsh -c "$URI" dumpxml --inactive "$VM")" \
+    || die "could not read inactive XML for $VM at $URI"
 
   for dev in /sys/bus/pci/devices/*; do
     class="$(<"$dev/class")"; [[ "$class" == 0x03* ]] || continue
@@ -621,20 +700,14 @@ configure_interactive() {
     vm_has_pci_hostdev "$item" || warn "$item is not a persistent PCI hostdev in $VM; add it to the VM before a transition"
   done
 
-  current_disk="$(discover_disk_from_vm)"; disks=('')
-  disk_labels=('No raw block disk / file-backed VM')
-  if [[ -n "$current_disk" ]]; then
-    disks+=("$current_disk"); disk_labels+=("Current VM block disk: $current_disk")
-    disk_targets+=("$(readlink -f "$current_disk")")
+  discover_disks_from_vm
+  WIN_DISK="${VM_RAW_DISKS[0]:-}"
+  printf '\nRaw block disks attached to %s:\n' "$VM"
+  if ((${#VM_RAW_DISKS[@]} == 0)); then
+    printf '  none (file-backed VM)\n'
+  else
+    for item in "${VM_RAW_DISKS[@]}"; do printf '  %s\n' "$item"; done
   fi
-  for dev in /dev/disk/by-id/*; do
-    [[ -L "$dev" && "$dev" != *-part* ]] || continue
-    target="$(readlink -f "$dev")"
-    [[ "$(lsblk -dnro TYPE "$target" 2>/dev/null)" == "disk" ]] || continue
-    for disk in "${disk_targets[@]}"; do [[ "$disk" == "$target" ]] && continue 2; done
-    disks+=("$dev"); disk_targets+=("$target"); disk_labels+=("$dev | $(lsblk -dnro MODEL,SIZE "$target")")
-  done
-  choose_one 'Select the VM raw disk, if any:' "${disk_labels[@]}"; WIN_DISK="${disks[$CHOICE_INDEX]}"
 
   for dev in /sys/bus/usb/devices/*; do
     [[ -r "$dev/idVendor" && -r "$dev/idProduct" ]] || continue
@@ -691,6 +764,16 @@ confirm() {
   local answer
   read -rp "$1 [y/N] " answer
   [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+run_menu_action() {
+  local rc
+  set +e
+  (set -Eeuo pipefail; "$@")
+  rc=$?
+  set -e
+  ((rc == 0)) || warn "action failed with status $rc"
+  return 0
 }
 
 read_main_menu_choice() {
@@ -763,16 +846,16 @@ interactive_menu() {
     choice="$MENU_CHOICE"
     printf '\n'
     case "$choice" in
-      1) confirm 'Shut down the VM, return its devices to Linux, and start the desktop?' && (return_linux_mode) || true ;;
-      2) confirm 'Start Windows with the selected devices and leave Linux at TTY?' && (start_windows_mode) || true ;;
-      3) confirm 'Start Windows with the selected devices, then start the Linux desktop?' && (start_coexist_mode) || true ;;
-      4) (status_report) || true ;;
-      5) (preflight_report) || true ;;
-      6) (hardware_report) || true ;;
-      7) (usb_action status) || true ;;
-      8) confirm 'Attach configured USB devices to the VM?' && (usb_action attach) || true ;;
-      9) confirm 'Detach configured USB devices back to Linux?' && (usb_action detach) || true ;;
-      10) (configure_interactive) || true ;;
+      1) if confirm 'Shut down the VM, return its devices to Linux, and start the desktop?'; then run_menu_action return_linux_mode; fi ;;
+      2) if confirm 'Start Windows with the selected devices and leave Linux at TTY?'; then run_menu_action start_windows_mode; fi ;;
+      3) if confirm 'Start Windows with the selected devices, then start the Linux desktop?'; then run_menu_action start_coexist_mode; fi ;;
+      4) run_menu_action status_report ;;
+      5) run_menu_action preflight_report ;;
+      6) run_menu_action hardware_report ;;
+      7) run_menu_action usb_action status ;;
+      8) if confirm 'Attach configured USB devices to the VM?'; then run_menu_action usb_action attach; fi ;;
+      9) if confirm 'Detach configured USB devices back to Linux?'; then run_menu_action usb_action detach; fi ;;
+      10) run_menu_action configure_interactive ;;
       0) return 0 ;;
       *) printf 'Unknown selection.\n' ;;
     esac
@@ -810,4 +893,6 @@ dispatch() {
   esac
 }
 
-dispatch "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  dispatch "$@"
+fi
