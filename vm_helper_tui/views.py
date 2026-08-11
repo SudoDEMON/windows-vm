@@ -91,12 +91,14 @@ class Renderer:
         return Rect(rect.y + 1, rect.x + 2, rect.h - 2, rect.w - 4)
 
     def render(self, state: DashboardState, action: ActionInfo | None, logs: list[str],
-               wizard: WizardState | None = None, modal: str = "") -> None:
+               wizard: WizardState | None = None, modal: str = "", terminal_log: bool = False) -> None:
         self.screen.erase()
         self.regions = []
         height, width = self.screen.getmaxyx()
         if wizard is not None:
             self._wizard(state, wizard, height, width)
+        elif terminal_log:
+            self._terminal_log(action, logs, state.log_scroll, height, width)
         else:
             mode = layout_mode(width, height)
             self._header(state, action, width)
@@ -129,7 +131,7 @@ class Renderer:
         self.text(1, 1, "-" * max(0, width - 2), width - 2, self.colors["dim"])
 
     def _footer(self, state: DashboardState, height: int, width: int) -> None:
-        help_text = "Arrows/jk move  Enter select  Tab panels  r refresh  c configure  q quit"
+        help_text = "Up/Down move  Enter select  Tab panels  t terminal  r refresh  c config  q quit"
         message = state.error or state.notice or help_text
         attr = self.colors["bad"] if state.error else self.colors["warn"] if state.notice else self.colors["dim"]
         self.text(height - 1, 1, message, width - 2, attr)
@@ -145,8 +147,8 @@ class Renderer:
         left_w = max(40, width // 3)
         right_w = width - left_w
         left_heights = (10, 11, body_h - 21)
-        right_heights = (9, 11, body_h - 20)
-        self._actions(state, action, self.box(Rect(top, 0, left_heights[0], left_w), "Actions"))
+        right_heights = (10, 11, body_h - 21)
+        self._actions(state, action, self.box(Rect(top, 0, left_heights[0], left_w), "Menu"))
         self._host(state, self.box(Rect(top + left_heights[0], 0, left_heights[1], left_w), "Host"))
         self._usb(state, self.box(Rect(top + sum(left_heights[:2]), 0, left_heights[2], left_w), "USB"))
         self._vm(state, self.box(Rect(top, left_w, right_heights[0], right_w), "Virtual Machine"))
@@ -278,6 +280,25 @@ class Renderer:
             self.text(area.y, area.x, "No action log yet", area.w, self.colors["dim"])
         if scroll:
             self.text(area.y, max(area.x, area.x + area.w - 15), f"[{scroll} lines back]", 15, self.colors["warn"])
+
+    def _terminal_log(self, action: ActionInfo | None, logs: list[str], scroll: int,
+                      height: int, width: int) -> None:
+        self.text(0, 1, "VM HELPER ACTION TERMINAL", width - 2, self.colors["title"])
+        if action:
+            label = next((spec.label for spec in ACTIONS if spec.worker_action == action.action), action.action)
+            status_attr = self.colors["warn"] if action.active else (
+                self.colors["good"] if action.effective_status == "complete" else self.colors["bad"]
+            )
+            status = f"{label}: {action.status_text}"
+            self.text(0, max(1, width - len(status) - 2), status, width - 2, status_attr)
+            command = f"$ vm-helper {action.action}    # detached PID {action.pid}"
+        else:
+            command = "$ waiting for an action"
+        self.text(2, 1, command, width - 2, self.colors["dim"])
+        self.text(3, 1, "-" * max(0, width - 2), width - 2, self.colors["dim"])
+        self._logs(logs, scroll, Rect(4, 1, max(0, height - 6), max(0, width - 2)))
+        footer = "Up/Down/PgUp/PgDn scroll  t/Esc dashboard  q quit (worker continues)"
+        self.text(height - 1, 1, footer, width - 2, self.colors["dim"])
 
     def _wizard(self, state: DashboardState, wizard: WizardState, height: int, width: int) -> None:
         self.text(0, 1, "VM HELPER CONFIGURATION", width - 2, self.colors["title"])

@@ -137,7 +137,14 @@ class Application:
                 self.refresh_telemetry()
                 self.refresh_action()
                 modal = ACTIONS[self.pending_action].confirmation if self.pending_action is not None else ""
-                self.renderer.render(self.state, self.current_action, self.logs, self.wizard, modal)
+                self.renderer.render(
+                    self.state,
+                    self.current_action,
+                    self.logs,
+                    self.wizard,
+                    modal,
+                    self.state.terminal_log,
+                )
                 key = self.screen.getch()
                 if key == -1:
                     continue
@@ -168,6 +175,9 @@ class Application:
         if self.wizard is not None:
             self._handle_wizard(command)
             return
+        if self.state.terminal_log:
+            self._handle_terminal_log(command)
+            return
         if command in ("quit", "escape"):
             self.running = False
         elif command == "up":
@@ -195,10 +205,26 @@ class Application:
             else:
                 self.wizard = WizardState()
                 self.force_static = True
+        elif command == "terminal_log":
+            self.state.terminal_log = True
         elif command == "log_up":
             self.state.log_scroll = min(max(0, len(self.logs) - 1), self.state.log_scroll + 5)
         elif command == "log_down":
             self.state.log_scroll = max(0, self.state.log_scroll - 5)
+        elif command == "resize":
+            self.screen.erase()
+
+    def _handle_terminal_log(self, command: str) -> None:
+        if command == "quit":
+            self.running = False
+        elif command in ("escape", "terminal_log"):
+            self.state.terminal_log = False
+        elif command in ("log_up", "up"):
+            amount = 1 if command == "up" else 5
+            self.state.log_scroll = min(max(0, len(self.logs) - 1), self.state.log_scroll + amount)
+        elif command in ("log_down", "down"):
+            amount = 1 if command == "down" else 5
+            self.state.log_scroll = max(0, self.state.log_scroll - amount)
         elif command == "resize":
             self.screen.erase()
 
@@ -244,6 +270,7 @@ class Application:
             self.state.error = ""
             self.state.log_scroll = 0
             self.state.tab = COMPACT_TABS.index("Logs")
+            self.state.terminal_log = True
             if len(worker) > 1:
                 self.action_marker = (worker[0], "running", None)
             self.refresh_action()

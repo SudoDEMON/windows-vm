@@ -39,7 +39,7 @@ class PanelSpec:
 
 
 PANEL_REGISTRY = (
-    PanelSpec("actions", "Actions", 10, "Overview"),
+    PanelSpec("actions", "Menu", 10, "Overview"),
     PanelSpec("host", "Host", 20, "Overview"),
     PanelSpec("vm", "Virtual Machine", 30, "Overview"),
     PanelSpec("gpu_io", "GPU / I/O", 40, "GPU / I/O"),
@@ -104,6 +104,7 @@ def map_key(key: int) -> str | None:
         ord("k"): "up",
         ord("r"): "refresh",
         ord("c"): "configure",
+        ord("t"): "terminal_log",
         ord("["): "log_up",
         ord("]"): "log_down",
         ord(" "): "toggle",
@@ -154,6 +155,7 @@ class DashboardState:
     selected_action: int = 0
     tab: int = 0
     log_scroll: int = 0
+    terminal_log: bool = False
     last_dynamic: float = 0.0
     last_static: float = 0.0
 

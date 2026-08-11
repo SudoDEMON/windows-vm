@@ -45,7 +45,7 @@ The dashboard refreshes dynamic counters every second, retains 60 samples for AS
 - Host: aggregate and per-core CPU, memory, load, uptime, active-interface throughput, aggregate physical-disk I/O, and raw VM-disk health.
 - VM: state, vCPU/memory counters, CPU utilization, network/block throughput, and configured vCPU pinning.
 - Ownership: current Linux/Windows mode, display-manager state, PCI driver and IOMMU ownership, NVIDIA telemetry while host-owned, and USB presence/attachment.
-- Actions: Linux, Windows, Linux + Windows, read-only validation, and live USB handoff.
+- Menu: Linux, Windows, Linux + Windows, read-only validation, and live USB handoff.
 
 At 120x35 or larger, all panels remain visible. From 80x24 through the large-layout threshold, panels use tabs. Smaller terminals show a resize message while `q` and Esc continue to work. The renderer uses portable ASCII borders and adapts to 8-color, 256-color, Linux-console, SSH, and graphical terminals.
 
@@ -55,13 +55,13 @@ Keyboard controls:
 - Enter, numbers `1`-`6`, or displayed hotkeys: choose an action; `y` confirms mutations.
 - Space: toggle USB selections in the wizard; Esc/Left goes back.
 - Page Up/Page Down or `[`/`]`: scroll the integrated action log.
-- `c`: configuration wizard; `r`: refresh; `q` or Esc: exit.
+- `t`: toggle the full-screen Action Terminal; `c`: configuration wizard; `r`: refresh; `q` exits.
 
 Mouse selection and log-wheel scrolling are enabled when the terminal reports mouse events. Keyboard operation is always available.
 
 `check` is a read-only transition preflight. It validates persistent PCI hostdev membership, PCI driver consistency, raw-disk safety, configured USB presence, and vendor GPU health without changing ownership.
 
-Starting an action automatically selects the Logs tab in compact mode. The header and footer distinguish `RUNNING`, `SUCCEEDED`, `FAILED (exit N)`, and a stopped worker with incomplete metadata; the integrated log contains the reason for a failure. Closing the dashboard never cancels a detached action.
+Starting an action automatically opens the full-screen Action Terminal, which streams the same mode-`0600` detached-worker log shown in the dashboard panel. Use Up/Down or Page Up/Page Down to scroll and `t` or Esc to return to the dashboard. The terminal header distinguishes `RUNNING`, `SUCCEEDED`, `FAILED (exit N)`, and a stopped worker with incomplete metadata. Closing the dashboard never cancels a detached action.
 
 Legacy commands resolve to the same implementation:
 
@@ -158,7 +158,7 @@ git diff --check
 
 The read-only commands are safe to run from a desktop. GPU and USB ownership commands intentionally mutate machine state and may require sudo. USB attach/detach errors are reported instead of being treated as an assumed already-attached state.
 
-If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw console, commonly `xterm-256color` elsewhere), then use `reset` or the classic menu. `TERM=dumb` intentionally bypasses curses. If a TUI disappears during a transition, relaunch it to reconnect; do not start an opposing direct command while the action lock is active. If Validate reports `FAILED`, open the Logs tab: this is a completed read-only check with a failed safety condition, not a transition that is still running.
+If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw console, commonly `xterm-256color` elsewhere), then use `reset` or the classic menu. `TERM=dumb` intentionally bypasses curses. If a TUI disappears during a transition, relaunch it to reconnect; do not start an opposing direct command while the action lock is active. Press `t` to reopen the most recent Action Terminal. If Validate reports `FAILED`, its output describes a completed read-only check with a failed safety condition, not a transition that is still running.
 
 ## Handoff
 

@@ -24,7 +24,7 @@ def set_size(fd: int, rows: int, columns: int) -> None:
 
 class PtyIntegrationTests(unittest.TestCase):
     def run_tui(self, term: str, rows: int, columns: int, fake_delay: float = 0,
-                max_quit_latency: float | None = None) -> bytes:
+                max_quit_latency: float | None = None, launch_action: bool = False) -> bytes:
         master, slave = pty.openpty()
         set_size(slave, rows, columns)
         before = termios.tcgetattr(slave)
@@ -54,13 +54,19 @@ class PtyIntegrationTests(unittest.TestCase):
             deadline = time.monotonic() + 8
             try:
                 time.sleep(0.7)
-                os.write(master, b"\t")
-                time.sleep(0.2)
-                set_size(slave, max(18, rows - 3), max(70, columns - 5))
-                os.killpg(process.pid, signal.SIGWINCH)
-                time.sleep(0.2)
-                os.write(master, b"r")
-                time.sleep(0.3)
+                if launch_action:
+                    os.write(master, b"4")
+                    time.sleep(0.1)
+                    os.write(master, b"y")
+                    time.sleep(0.8)
+                else:
+                    os.write(master, b"\t")
+                    time.sleep(0.2)
+                    set_size(slave, max(18, rows - 3), max(70, columns - 5))
+                    os.killpg(process.pid, signal.SIGWINCH)
+                    time.sleep(0.2)
+                    os.write(master, b"r")
+                    time.sleep(0.3)
                 quit_started = time.monotonic()
                 os.write(master, b"q")
                 while process.poll() is None and time.monotonic() < deadline:
@@ -104,6 +110,15 @@ class PtyIntegrationTests(unittest.TestCase):
 
     def test_quit_remains_responsive_during_slow_telemetry(self) -> None:
         self.run_tui("xterm-256color", 24, 80, fake_delay=2.0, max_quit_latency=0.8)
+
+    def test_action_opens_live_terminal_log(self) -> None:
+        output = self.run_tui("xterm-256color", 24, 80, launch_action=True)
+        decoded = output.decode("utf-8", "replace")
+        self.assertIn("ACTION TERMINAL", decoded)
+        self.assertIn("$ vm-helper check", decoded)
+        self.assertIn("fake check started", decoded)
+        self.assertIn("fake action complete", decoded)
+        self.assertIn("Validate: SUCCEEDED", decoded)
 
     def test_classic_environment_fallback_exits_cleanly(self) -> None:
         master, slave = pty.openpty()

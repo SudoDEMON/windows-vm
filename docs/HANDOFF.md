@@ -82,11 +82,11 @@ If the TUI cannot initialize, use `classic-menu`, `configure-classic`, or `VM_HE
 
 If a transition outlives its terminal, relaunch the dashboard to reconnect to the newest active action. A stale metadata record is not treated as an active lock: the Bash `flock` remains the authority. Never add force-kill UI for transition workers.
 
-Dynamic snapshots and static inventory run as separate pollable subprocess groups; they must never block `getch()`. Dashboard exit may terminate those read-only collectors, but it must not signal detached transition workers. Compact mode selects Logs when an action starts, and metadata state plus return code must remain visible after its PID exits.
+Dynamic snapshots and static inventory run as separate pollable subprocess groups; they must never block `getch()`. Dashboard exit may terminate those read-only collectors, but it must not signal detached transition workers. Starting an action opens the full-screen Action Terminal over the same reconnectable log; `t`/Esc returns to the dashboard. Metadata state plus return code must remain visible after its PID exits.
 
 ## Validation Additions
 
-`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, shared mutation locking, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
+`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, shared mutation locking, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, the live Action Terminal, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
 
 ## Repository Hygiene
 

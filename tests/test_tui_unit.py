@@ -87,10 +87,12 @@ class LayoutAndInputTests(unittest.TestCase):
         registered = {panel.key for panel in PANEL_REGISTRY}
         profiled = {key for column in DEFAULT_LAYOUT_PROFILE["large_columns"] for key in column}
         self.assertEqual(profiled, registered)
+        self.assertEqual(next(panel.title for panel in PANEL_REGISTRY if panel.key == "actions"), "Menu")
 
     def test_key_and_mouse_mapping(self) -> None:
         self.assertEqual(map_key(curses.KEY_DOWN), "down")
         self.assertEqual(map_key(ord("1")), "action:0")
+        self.assertEqual(map_key(ord("t")), "terminal_log")
         self.assertEqual(map_key(27), "escape")
         region = MouseRegion(2, 3, 4, 8, "action:2")
         self.assertEqual(map_mouse(3, 5, curses.BUTTON1_CLICKED, [region]), "action:2")
