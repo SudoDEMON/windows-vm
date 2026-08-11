@@ -23,12 +23,16 @@ def set_size(fd: int, rows: int, columns: int) -> None:
 
 
 class PtyIntegrationTests(unittest.TestCase):
-    def run_tui(self, term: str, rows: int, columns: int) -> bytes:
+    def run_tui(self, term: str, rows: int, columns: int, fake_delay: float = 0,
+                max_quit_latency: float | None = None) -> bytes:
         master, slave = pty.openpty()
         set_size(slave, rows, columns)
         before = termios.tcgetattr(slave)
         environment = os.environ.copy()
         environment.update(TERM=term, PYTHONPATH=str(ROOT))
+        environment.pop("VM_HELPER_FAKE_DELAY", None)
+        if fake_delay:
+            environment["VM_HELPER_FAKE_DELAY"] = str(fake_delay)
         with tempfile.TemporaryDirectory() as runtime:
             environment["XDG_RUNTIME_DIR"] = runtime
 
@@ -57,6 +61,7 @@ class PtyIntegrationTests(unittest.TestCase):
                 time.sleep(0.2)
                 os.write(master, b"r")
                 time.sleep(0.3)
+                quit_started = time.monotonic()
                 os.write(master, b"q")
                 while process.poll() is None and time.monotonic() < deadline:
                     readable, _, _ = select.select([master], [], [], 0.1)
@@ -66,6 +71,8 @@ class PtyIntegrationTests(unittest.TestCase):
                         except OSError:
                             break
                 process.wait(timeout=2)
+                if max_quit_latency is not None:
+                    self.assertLess(time.monotonic() - quit_started, max_quit_latency)
                 while True:
                     readable, _, _ = select.select([master], [], [], 0)
                     if not readable:
@@ -94,6 +101,9 @@ class PtyIntegrationTests(unittest.TestCase):
                 self.assertIn("VM HELPER", decoded)
                 self.assertIn("LINUX", decoded)
                 self.assertIn(layout_marker, decoded)
+
+    def test_quit_remains_responsive_during_slow_telemetry(self) -> None:
+        self.run_tui("xterm-256color", 24, 80, fake_delay=2.0, max_quit_latency=0.8)
 
     def test_classic_environment_fallback_exits_cleanly(self) -> None:
         master, slave = pty.openpty()

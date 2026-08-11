@@ -116,8 +116,16 @@ class Renderer:
         mode_attr = self.colors["bad"] if "ERROR" in state.mode else self.colors["good"]
         self.text(0, 1, "VM HELPER", 12, self.colors["title"])
         self.text(0, 15, state.mode, max(1, width - 40), mode_attr)
-        worker = f"ACTION {action.action}: {action.status}" if action else "idle"
-        self.text(0, max(1, width - len(worker) - 2), worker, width - 2, self.colors["warn"] if action and action.active else self.colors["dim"])
+        if action:
+            label = next((spec.label for spec in ACTIONS if spec.worker_action == action.action), action.action)
+            worker = f"{label}: {action.status_text}"
+            worker_attr = self.colors["warn"] if action.active else (
+                self.colors["good"] if action.effective_status == "complete" else self.colors["bad"]
+            )
+        else:
+            worker = "ACTION: idle"
+            worker_attr = self.colors["dim"]
+        self.text(0, max(1, width - len(worker) - 2), worker, width - 2, worker_attr)
         self.text(1, 1, "-" * max(0, width - 2), width - 2, self.colors["dim"])
 
     def _footer(self, state: DashboardState, height: int, width: int) -> None:

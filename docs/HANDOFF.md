@@ -31,10 +31,10 @@ The validated internal configuration endpoint accepts exactly one VM, one displa
 
 ## TUI Architecture
 
-- `vm_helper_tui/app.py`: refresh loop, confirmations, sudo handoff, detached actions, and wizard orchestration.
+- `vm_helper_tui/app.py`: non-blocking refresh scheduling, confirmations, sudo handoff, detached actions, and wizard orchestration.
 - `vm_helper_tui/state.py`: panel registry/default layout profile, responsive thresholds, input/mouse mapping, and wizard state.
 - `vm_helper_tui/views.py`: curses rendering with ASCII borders and adaptive color pairs.
-- `vm_helper_tui/protocol.py`: strict `VMH1` NUL-record parser, backend calls, and action/log reconnection.
+- `vm_helper_tui/protocol.py`: strict `VMH1` NUL-record parser, synchronous action/configuration calls, pollable read-only telemetry calls, and action/log reconnection.
 - `vm_helper_tui/telemetry.py`: `/proc` host collection, counter deltas, mode derivation, and 60-sample sparklines.
 
 `vm-helper machine snapshot` and `machine inventory [VM]` emit a `VMH1\0` header followed by typed records, decimal field counts, and NUL-terminated fields. Never replace this with parsing the human `status` or `hardware` output. Additive record types are compatible; changing field meaning requires a protocol version bump and parser tests.
@@ -82,9 +82,11 @@ If the TUI cannot initialize, use `classic-menu`, `configure-classic`, or `VM_HE
 
 If a transition outlives its terminal, relaunch the dashboard to reconnect to the newest active action. A stale metadata record is not treated as an active lock: the Bash `flock` remains the authority. Never add force-kill UI for transition workers.
 
+Dynamic snapshots and static inventory run as separate pollable subprocess groups; they must never block `getch()`. Dashboard exit may terminate those read-only collectors, but it must not signal detached transition workers. Compact mode selects Logs when an action starts, and metadata state plus return code must remain visible after its PID exits.
+
 ## Validation Additions
 
-`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, shared mutation locking, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard state, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
+`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, shared mutation locking, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
 
 ## Repository Hygiene
 

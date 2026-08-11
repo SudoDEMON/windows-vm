@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
+import time
 from typing import Iterable
 
 
@@ -62,6 +64,77 @@ def records_by_kind(records: Iterable[Record]) -> dict[str, list[tuple[str, ...]
     return grouped
 
 
+def _decode_backend_result(returncode: int, stdout: bytes, stderr: bytes) -> list[Record]:
+    if returncode != 0:
+        message = stderr.decode("utf-8", "replace").strip()
+        raise BackendError(message or f"backend exited with status {returncode}")
+    try:
+        return parse_records(stdout)
+    except ProtocolError as exc:
+        detail = stderr.decode("utf-8", "replace").strip()
+        raise BackendError(f"{exc}{': ' + detail if detail else ''}") from exc
+
+
+class PendingCall:
+    """A backend call that can be polled without blocking the curses input loop."""
+
+    def __init__(self, command: list[str], timeout: float):
+        self.command = command
+        self.timeout = timeout
+        self.deadline = time.monotonic() + timeout
+        self._stdout = tempfile.TemporaryFile()
+        self._stderr = tempfile.TemporaryFile()
+        self._closed = False
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=self._stdout,
+                stderr=self._stderr,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self.close()
+            raise BackendError(str(exc)) from exc
+
+    def poll(self) -> list[Record] | None:
+        returncode = self.process.poll()
+        if returncode is None:
+            if time.monotonic() < self.deadline:
+                return None
+            self.cancel()
+            raise BackendError(f"backend timed out after {self.timeout:g} seconds")
+        self.process.wait()
+        self._stdout.seek(0)
+        self._stderr.seek(0)
+        stdout = self._stdout.read()
+        stderr = self._stderr.read()
+        self.close()
+        return _decode_backend_result(returncode, stdout, stderr)
+
+    def cancel(self) -> None:
+        if self.process.poll() is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self.process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.process.wait(timeout=0.5)
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._stdout.close()
+            self._stderr.close()
+            self._closed = True
+
+
 class Backend:
     def __init__(self, executable: str, timeout: float = 4.0):
         self.executable = str(Path(executable).resolve())
@@ -79,23 +152,25 @@ class Backend:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise BackendError(str(exc)) from exc
-        if result.returncode != 0:
-            message = result.stderr.decode("utf-8", "replace").strip()
-            raise BackendError(message or f"backend exited with status {result.returncode}")
-        try:
-            return parse_records(result.stdout)
-        except ProtocolError as exc:
-            detail = result.stderr.decode("utf-8", "replace").strip()
-            raise BackendError(f"{exc}{': ' + detail if detail else ''}") from exc
+        return _decode_backend_result(result.returncode, result.stdout, result.stderr)
 
     def snapshot(self) -> list[Record]:
         return self._call(["machine", "snapshot"])
+
+    def begin_snapshot(self) -> PendingCall:
+        return PendingCall([self.executable, "machine", "snapshot"], self.timeout)
 
     def inventory(self, vm: str = "") -> list[Record]:
         args = ["machine", "inventory"]
         if vm:
             args.append(vm)
         return self._call(args)
+
+    def begin_inventory(self, vm: str = "") -> PendingCall:
+        args = [self.executable, "machine", "inventory"]
+        if vm:
+            args.append(vm)
+        return PendingCall(args, self.timeout)
 
     def configure(self, vm: str, gpu: str, usb_ids: Iterable[str]) -> list[Record]:
         args = ["machine", "configure", "--vm", vm, "--gpu", gpu]
@@ -132,6 +207,26 @@ class ActionInfo:
     @property
     def active(self) -> bool:
         return self.status == "running" and process_alive(self.pid)
+
+    @property
+    def effective_status(self) -> str:
+        if self.status == "running" and not self.active:
+            return "stopped"
+        return self.status
+
+    @property
+    def status_text(self) -> str:
+        status = self.effective_status
+        if status == "running":
+            return "RUNNING"
+        if status == "complete" and self.returncode in (None, 0):
+            return "SUCCEEDED"
+        if status == "failed" or self.returncode not in (None, 0):
+            suffix = f" (exit {self.returncode})" if self.returncode is not None else ""
+            return f"FAILED{suffix}"
+        if status == "stopped":
+            return "STOPPED (incomplete metadata)"
+        return status.upper()
 
 
 def process_alive(pid: int) -> bool:

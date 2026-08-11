@@ -40,7 +40,7 @@ Python/curses absence, `TERM=dumb`, or non-interactive input automatically selec
 
 ## Dashboard
 
-The dashboard refreshes dynamic counters every second, retains 60 samples for ASCII sparklines, and refreshes hardware/configuration discovery every five seconds. Press `r` for an immediate full refresh.
+The dashboard refreshes dynamic counters every second, retains 60 samples for ASCII sparklines, and refreshes hardware/configuration discovery every five seconds. These read-only backend polls run asynchronously so a slow `virsh`, `nvidia-smi`, or hardware scan cannot stall keyboard input. Press `r` for an immediate full refresh.
 
 - Host: aggregate and per-core CPU, memory, load, uptime, active-interface throughput, aggregate physical-disk I/O, and raw VM-disk health.
 - VM: state, vCPU/memory counters, CPU utilization, network/block throughput, and configured vCPU pinning.
@@ -60,6 +60,8 @@ Keyboard controls:
 Mouse selection and log-wheel scrolling are enabled when the terminal reports mouse events. Keyboard operation is always available.
 
 `check` is a read-only transition preflight. It validates persistent PCI hostdev membership, PCI driver consistency, raw-disk safety, configured USB presence, and vendor GPU health without changing ownership.
+
+Starting an action automatically selects the Logs tab in compact mode. The header and footer distinguish `RUNNING`, `SUCCEEDED`, `FAILED (exit N)`, and a stopped worker with incomplete metadata; the integrated log contains the reason for a failure. Closing the dashboard never cancels a detached action.
 
 Legacy commands resolve to the same implementation:
 
@@ -122,7 +124,7 @@ The wizard selects a libvirt domain, reviews a GPU with its companion functions/
 
 ## Runtime Files
 
-Detached actions store one mode-`0600` `.log` and `.meta` pair per action under `$XDG_RUNTIME_DIR/vm-helper/`. The metadata uses the same versioned NUL-delimited record protocol as dashboard snapshots, so labels and paths are never reconstructed by splitting display text. A later TUI launch finds a running or most recent action and reconnects to its log.
+Detached actions store one mode-`0600` `.log` and `.meta` pair per action under `$XDG_RUNTIME_DIR/vm-helper/`. The metadata uses the same versioned NUL-delimited record protocol as dashboard snapshots, so labels and paths are never reconstructed by splitting display text. A later TUI launch finds a running or most recent action, reconnects to its log, and shows its final outcome even after the worker PID exits.
 
 When `$XDG_RUNTIME_DIR` is unavailable, the helper uses `/run/user/$UID` when present, then a private directory below the system temporary directory. The runtime directory and mutation lock are mode `0700`/`0600`. Runtime records are transient and must not be committed.
 
@@ -156,7 +158,7 @@ git diff --check
 
 The read-only commands are safe to run from a desktop. GPU and USB ownership commands intentionally mutate machine state and may require sudo. USB attach/detach errors are reported instead of being treated as an assumed already-attached state.
 
-If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw console, commonly `xterm-256color` elsewhere), then use `reset` or the classic menu. `TERM=dumb` intentionally bypasses curses. If a TUI disappears during a transition, relaunch it to reconnect; do not start an opposing direct command while the action lock is active.
+If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw console, commonly `xterm-256color` elsewhere), then use `reset` or the classic menu. `TERM=dumb` intentionally bypasses curses. If a TUI disappears during a transition, relaunch it to reconnect; do not start an opposing direct command while the action lock is active. If Validate reports `FAILED`, open the Logs tab: this is a completed read-only check with a failed safety condition, not a transition that is still running.
 
 ## Handoff
 

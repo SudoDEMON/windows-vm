@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from vm_helper_tui.protocol import ActionStore, Backend, ProtocolError, parse_records, records_by_kind
+from vm_helper_tui.protocol import ActionInfo, ActionStore, Backend, ProtocolError, parse_records, records_by_kind
 from vm_helper_tui.state import (
     DEFAULT_LAYOUT_PROFILE,
     Inventory,
@@ -123,6 +123,35 @@ class WizardTests(unittest.TestCase):
 
 
 class ReconnectionTests(unittest.TestCase):
+    def test_action_status_text_distinguishes_outcomes(self) -> None:
+        path = Path("/tmp/action.log")
+        failed = ActionInfo("failed", 0, "check", "failed", 1, 2, 1, path, path)
+        complete = ActionInfo("complete", 0, "check", "complete", 1, 2, 0, path, path)
+        stale = ActionInfo("stale", 999_999_999, "check", "running", 1, None, None, path, path)
+        self.assertEqual(failed.status_text, "FAILED (exit 1)")
+        self.assertEqual(complete.status_text, "SUCCEEDED")
+        self.assertEqual(stale.status_text, "STOPPED (incomplete metadata)")
+
+    def test_snapshot_call_is_nonblocking(self) -> None:
+        fake = Path(__file__).with_name("fake-vm-helper")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"XDG_RUNTIME_DIR": directory, "VM_HELPER_FAKE_DELAY": "0.3"},
+        ):
+            call = Backend(str(fake), timeout=2).begin_snapshot()
+            try:
+                self.assertIsNone(call.poll())
+                deadline = time.monotonic() + 2
+                records = None
+                while records is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                    records = call.poll()
+                self.assertIsNotNone(records)
+                assert records is not None
+                self.assertIn("snapshot", records_by_kind(records))
+            finally:
+                call.cancel()
+
     def test_reads_active_metadata_and_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); log = root / "action-token.log"; meta = root / "action-token.meta"

@@ -54,6 +54,7 @@ def main() -> int:
     if args[:1] == ["__worker"]:
         return worker(args[1], args[2], int(args[3]))
     if args[:2] == ["machine", "snapshot"]:
+        time.sleep(float(os.environ.get("VM_HELPER_FAKE_DELAY", "0")))
         sys.stdout.buffer.write(encoded([
             ("snapshot", (int(time.time()),)),
             ("vm", ("test-windows", "shut off", "qemu:///test", 8, 0, 0, 16 * 1024 * 1024)),
@@ -64,6 +65,7 @@ def main() -> int:
         ]))
         return 0
     if args[:2] == ["machine", "inventory"]:
+        time.sleep(float(os.environ.get("VM_HELPER_FAKE_DELAY", "0")))
         sys.stdout.buffer.write(encoded([
             ("inventory", (int(time.time()), args[2] if len(args) > 2 else "")),
             ("config", ("/tmp/vm-helper.env", "no", "", "qemu:///test")),

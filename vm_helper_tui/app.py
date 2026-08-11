@@ -10,8 +10,8 @@ from pathlib import Path
 import subprocess
 import time
 
-from .protocol import ActionInfo, ActionStore, Backend, BackendError, records_by_kind
-from .state import ACTIONS, DashboardState, WizardState, map_key, map_mouse
+from .protocol import ActionInfo, ActionStore, Backend, BackendError, PendingCall, records_by_kind
+from .state import ACTIONS, COMPACT_TABS, DashboardState, WizardState, map_key, map_mouse
 from .telemetry import HostCollector, VmDeltaTracker
 from .views import Renderer
 
@@ -28,12 +28,15 @@ class Application:
         self.wizard = WizardState() if mode == "configure" else None
         self.pending_action: int | None = None
         self.current_action: ActionInfo | None = None
+        self.dynamic_call: PendingCall | None = None
+        self.static_call: PendingCall | None = None
+        self.action_marker: tuple[str, str, int | None] | None = None
         self.logs: list[str] = []
         self.running = True
         self.force_dynamic = True
         self.force_static = True
         screen.keypad(True)
-        screen.timeout(200)
+        screen.timeout(100)
         try:
             curses.curs_set(0)
         except curses.error:
@@ -44,59 +47,113 @@ class Application:
         except curses.error:
             pass
 
-    def refresh_dynamic(self) -> None:
-        host = self.host_collector.sample()
+    def _finish_dynamic(self) -> None:
+        if self.dynamic_call is None:
+            return
         try:
-            records = self.backend.snapshot()
+            records = self.dynamic_call.poll()
+            if records is None:
+                return
+            self.dynamic_call = None
+            host = self.host_collector.sample()
             vm_rates = self.vm_tracker.update(records)
             self.state.apply_snapshot(records, host, vm_rates)
         except BackendError as exc:
-            self.state.host = host
+            self.dynamic_call = None
             self.state.error = str(exc)
             self.state.last_dynamic = time.monotonic()
 
-    def refresh_static(self) -> None:
-        vm = self.wizard.vm if self.wizard and self.wizard.vm else ""
+    def _finish_static(self) -> None:
+        if self.static_call is None:
+            return
         try:
-            self.state.inventory.update(self.backend.inventory(vm))
+            records = self.static_call.poll()
+            if records is None:
+                return
+            self.static_call = None
+            self.state.inventory.update(records)
             self.state.last_static = time.monotonic()
             if self.wizard and self.wizard.vm and not self.wizard.usb_ids:
                 self.wizard.usb_ids = {
                     f"{item[1]}:{item[2]}" for item in self.state.inventory.usb if item[3] == "yes"
                 }
         except BackendError as exc:
+            self.static_call = None
             self.state.error = str(exc)
             self.state.last_static = time.monotonic()
+
+    def refresh_telemetry(self) -> None:
+        self._finish_dynamic()
+        self._finish_static()
+        now = time.monotonic()
+        if self.dynamic_call is None and (self.force_dynamic or now - self.state.last_dynamic >= 1.0):
+            try:
+                self.dynamic_call = self.backend.begin_snapshot()
+            except BackendError as exc:
+                self.state.error = str(exc)
+                self.state.last_dynamic = now
+            self.force_dynamic = False
+        if self.static_call is None and (self.force_static or now - self.state.last_static >= 5.0):
+            vm = self.wizard.vm if self.wizard and self.wizard.vm else ""
+            try:
+                self.static_call = self.backend.begin_inventory(vm)
+            except BackendError as exc:
+                self.state.error = str(exc)
+                self.state.last_static = now
+            self.force_static = False
+
+    @staticmethod
+    def _action_label(action: str) -> str:
+        return next((spec.label for spec in ACTIONS if spec.worker_action == action), action)
+
+    def _action_notice(self, action: ActionInfo) -> str:
+        label = self._action_label(action.action)
+        if action.active:
+            return f"{label} is RUNNING (PID {action.pid}); Action Log updates live"
+        return f"{label} {action.status_text}; see Action Log for details"
 
     def refresh_action(self) -> None:
         self.current_action = self.actions.current()
         self.logs = self.actions.read_log(self.current_action)
         self.state.log_scroll = min(self.state.log_scroll, max(0, len(self.logs) - 1))
+        if self.current_action is None:
+            self.action_marker = None
+            return
+        marker = (
+            self.current_action.token,
+            self.current_action.effective_status,
+            self.current_action.returncode,
+        )
+        previous = self.action_marker
+        if previous is None or previous[0] != marker[0]:
+            self.state.notice = self._action_notice(self.current_action)
+        elif previous[1] == "running" and marker[1] != "running":
+            self.state.notice = self._action_notice(self.current_action)
+        self.action_marker = marker
 
     def loop(self) -> None:
-        while self.running:
-            now = time.monotonic()
-            if self.force_dynamic or now - self.state.last_dynamic >= 1.0:
-                self.refresh_dynamic()
-                self.force_dynamic = False
-            if self.force_static or now - self.state.last_static >= 5.0:
-                self.refresh_static()
-                self.force_static = False
-            self.refresh_action()
-            modal = ACTIONS[self.pending_action].confirmation if self.pending_action is not None else ""
-            self.renderer.render(self.state, self.current_action, self.logs, self.wizard, modal)
-            key = self.screen.getch()
-            if key == -1:
-                continue
-            if self.pending_action is not None:
-                if key in (ord("y"), ord("Y")):
-                    self.confirm_pending()
-                elif key in (ord("n"), ord("N"), 27, ord("q")):
-                    self.pending_action = None
-                continue
-            command = self._command_for_key(key)
-            if command:
-                self.handle(command)
+        try:
+            while self.running:
+                self.refresh_telemetry()
+                self.refresh_action()
+                modal = ACTIONS[self.pending_action].confirmation if self.pending_action is not None else ""
+                self.renderer.render(self.state, self.current_action, self.logs, self.wizard, modal)
+                key = self.screen.getch()
+                if key == -1:
+                    continue
+                if self.pending_action is not None:
+                    if key in (ord("y"), ord("Y")):
+                        self.confirm_pending()
+                    elif key in (ord("n"), ord("N"), 27, ord("q")):
+                        self.pending_action = None
+                    continue
+                command = self._command_for_key(key)
+                if command:
+                    self.handle(command)
+        finally:
+            for call in (self.dynamic_call, self.static_call):
+                if call is not None:
+                    call.cancel()
 
     def _command_for_key(self, key: int) -> str | None:
         if key != curses.KEY_MOUSE:
@@ -186,6 +243,10 @@ class Application:
             self.state.notice = f"Detached {spec.label} action started (PID {worker[1] if len(worker) > 1 else '?'})"
             self.state.error = ""
             self.state.log_scroll = 0
+            self.state.tab = COMPACT_TABS.index("Logs")
+            if len(worker) > 1:
+                self.action_marker = (worker[0], "running", None)
+            self.refresh_action()
             self.force_dynamic = True
         except BackendError as exc:
             self.state.error = str(exc)
