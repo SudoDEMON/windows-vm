@@ -31,8 +31,14 @@ fi
 VM_XML=""
 TEMP_FILES=()
 VM_RAW_DISKS=()
+SUDO_KEEPALIVE_PID=""
 
 cleanup() {
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=""
+  fi
   ((${#TEMP_FILES[@]} == 0)) || rm -f -- "${TEMP_FILES[@]}"
 }
 trap cleanup EXIT
@@ -44,7 +50,25 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; 
 read_file() { [[ -r "$1" ]] && cat -- "$1" || true; }
 
 as_root() {
-  if ((EUID == 0)); then "$@"; else sudo "$@"; fi
+  if ((EUID == 0)); then "$@"; else sudo -n "$@"; fi
+}
+
+begin_root_session() {
+  ((EUID != 0)) || return 0
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill -0 "$SUDO_KEEPALIVE_PID" 2>/dev/null; then return 0; fi
+
+  if ! sudo -n true 2>/dev/null; then
+    [[ -t 0 ]] || die "sudo authorization is required; rerun from an interactive TTY"
+    log "authorizing privileged device and display-manager operations"
+    sudo -v || die "sudo authorization failed"
+  fi
+  sudo -n true 2>/dev/null \
+    || die "sudo credentials cannot be reused non-interactively; no devices were changed"
+
+  (
+    while sleep 20; do sudo -n -v >/dev/null 2>&1 || exit; done
+  ) &
+  SUDO_KEEPALIVE_PID=$!
 }
 
 domstate() {
@@ -427,6 +451,7 @@ start_windows_mode() {
   if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" && "$ALLOW_GUI" != "1" ]]; then
     die "graphical session detected; run from TTY/SSH or explicitly set ALLOW_GUI=1"
   fi
+  begin_root_session
   if systemctl is-active --quiet display-manager.service; then
     log "stopping display-manager to release the selected GPU"
     as_root systemctl stop display-manager.service || die "failed to stop display-manager"
@@ -450,21 +475,23 @@ start_windows_mode() {
 }
 
 start_coexist_mode() {
-  local state pci
+  local state pci started=0
   load_runtime_config
   state="$(required_domstate)"
   case "$state" in
     running) log "$VM is already running" ;;
-    "shut off") start_windows_mode ;;
+    "shut off") start_windows_mode; started=1 ;;
     *) die "$VM is $state" ;;
   esac
   wait_for_vfio || die "not every selected GPU function is on vfio-pci"
   for pci in "${GPU_PCI[@]}"; do log "$pci VM driver: $(driver_for "$pci")"; done
-  if ((READY_DELAY > 0)); then log "waiting ${READY_DELAY}s before starting display-manager"; sleep "$READY_DELAY"; fi
+  if ((started == 1 && READY_DELAY > 0)); then log "waiting ${READY_DELAY}s before starting display-manager"; sleep "$READY_DELAY"; fi
   if ! systemctl is-active --quiet display-manager.service; then
+    begin_root_session
     log "starting Linux display-manager on the remaining host GPU"
     as_root systemctl start display-manager.service || die "failed to start display-manager"
   fi
+  systemctl is-active --quiet display-manager.service || die "display-manager did not become active"
   log "Linux + Windows ready: $VM owns the selected GPU and Linux desktop is active"
 }
 
@@ -487,6 +514,7 @@ return_linux_mode() {
   local state pci driver primary_driver
   load_runtime_config
   state="$(required_domstate)"
+  begin_root_session
   case "$state" in
     running|paused|"in shutdown")
       log "$VM is $state; requesting graceful ACPI shutdown"

@@ -33,6 +33,7 @@ Legacy `REQUIRED_USB` is mapped to `USB_DEVICES`. `GPU_NODE` is no longer needed
 - Every attached raw block disk must be online and completely unmounted on Linux.
 - Configured USB devices must be connected before VM startup.
 - The display manager is stopped before handing the GPU to the VM.
+- Sudo authorization is acquired and kept alive before device transitions; post-handoff privileged calls never prompt for input.
 - Active GPU users and busy NVIDIA modules stop the transition.
 - Post-start verification requires every selected PCI function on `vfio-pci`.
 - Return-to-Linux skips libvirt reattach for devices already on a host driver. This prevents the fresh-boot reattach bug that can leave NVIDIA half-detached.

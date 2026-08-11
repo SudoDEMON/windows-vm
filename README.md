@@ -79,6 +79,7 @@ It writes ignored, mode-`0600` `vm-helper.env` and backs up an existing file bef
 ## Safety
 
 - Run GPU transitions from TTY or SSH. Graphical-session execution is rejected unless `ALLOW_GUI=1`.
+- Mutating GPU modes acquire and keep a reusable sudo timestamp before changing devices. Later privileged calls are non-interactive, so USB keyboard handoff cannot strand a password prompt; authorization failure stops before device ownership changes.
 - Every raw VM disk must exist, remain unmounted on Linux, and not report `offline`. A configured `WIN_DISK` must resolve to one of those attached disks.
 - Every selected GPU function must already exist in the VM's persistent PCI hostdev configuration.
 - Missing configured USB devices stop VM startup before display-manager shutdown.
@@ -91,6 +92,7 @@ It writes ignored, mode-`0600` `vm-helper.env` and backs up an existing file bef
 Required host commands:
 
 - Bash 5+
+- `sudo` for non-root GPU ownership transitions
 - `virsh` and a working system libvirt connection
 - `xmllint` from libxml2
 - `lspci`, `lscpu`, `lsblk`, `fuser`, `udevadm`, `modprobe`, `timeout`, and systemd
