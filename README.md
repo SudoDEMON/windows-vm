@@ -45,23 +45,25 @@ The dashboard refreshes dynamic counters every second, retains 60 samples for AS
 - Host: aggregate and per-core CPU, memory, load, uptime, active-interface throughput, aggregate physical-disk I/O, and raw VM-disk health.
 - VM: state, vCPU/memory counters, CPU utilization, network/block throughput, and configured vCPU pinning.
 - Ownership: current Linux/Windows mode, display-manager state, PCI driver and IOMMU ownership, NVIDIA telemetry while host-owned, and USB presence/attachment.
-- Menu: Linux, Windows, Linux + Windows, read-only validation, and live USB handoff.
+- Menu: Linux, Windows, Linux + Windows, read-only validation, live USB routing, configuration, and Quit.
 
 At 120x35 or larger, all panels remain visible. From 80x24 through the large-layout threshold, panels use tabs. Smaller terminals show a resize message while `q` and Esc continue to work. The renderer uses portable ASCII borders and adapts to 8-color, 256-color, Linux-console, SSH, and graphical terminals.
 
 Keyboard controls:
 
-- Arrows or `j`/`k`: move; Tab/Shift-Tab or Left/Right: change compact panel.
-- Enter, numbers `1`-`6`, or displayed hotkeys: choose an action; `y` confirms mutations.
+- Arrows or `j`/`k`: move through the seven visible menu entries; Tab/Shift-Tab changes compact panels.
+- Enter, numbers `1`-`7`, or displayed hotkeys: choose a menu entry; `y` confirms actions.
 - Space: toggle USB selections in the wizard; Esc/Left goes back.
-- Page Up/Page Down or `[`/`]`: scroll the integrated action log.
-- `t`: toggle the full-screen Action Terminal; `c`: configuration wizard; `r`: refresh; `q` exits.
+- Page Up/Page Down or `[`/`]`: scroll the integrated Activity Log without changing arrow-key menu navigation.
+- `r`: refresh; `q` exits from the dashboard and returns from an in-app page.
 
 Mouse selection and log-wheel scrolling are enabled when the terminal reports mouse events. Keyboard operation is always available.
 
 `check` is a read-only transition preflight. It validates persistent PCI hostdev membership, PCI driver consistency, raw-disk safety, configured USB presence, and vendor GPU health without changing ownership.
 
-Starting an action automatically opens the full-screen Action Terminal, which streams the same mode-`0600` detached-worker log shown in the dashboard panel. Use Up/Down or Page Up/Page Down to scroll and `t` or Esc to return to the dashboard. The terminal header distinguishes `RUNNING`, `SUCCEEDED`, `FAILED (exit N)`, and a stopped worker with incomplete metadata. Closing the dashboard never cancels a detached action.
+Actions stay on the dashboard and stream into Activity Log. The header and persistent status row distinguish `RUNNING`, `SUCCEEDED`, `FAILED (exit N)`, and a stopped worker with incomplete metadata; the separate footer row always keeps navigation help visible. Closing the dashboard never cancels a detached action.
+
+Selecting **USB** opens a full page inside the same curses session. It lists every connected non-hub USB VID:PID plus configured defaults that are currently missing, marks configuration defaults, and shows live Linux/Windows ownership. Up/Down selects a row, Left/Right chooses its staged owner, Space toggles it, and Enter or `a` applies all staged changes after one confirmation. Windows must already be running. Missing devices and duplicate VID:PID groups are shown but cannot be routed safely. Live routing never changes the defaults selected under **Configure**.
 
 Legacy commands resolve to the same implementation:
 
@@ -99,7 +101,7 @@ For multiple VMs or explicit hardware choices, run the full-screen wizard:
 ./vm-helper configure
 ```
 
-The wizard selects a libvirt domain, reviews a GPU with its companion functions/IOMMU state, reviews attached raw disks, multi-selects connected USB devices, and shows persistence warnings, CPU pinning, and transition timers before writing. Its validated Bash endpoint writes ignored, mode-`0600` `vm-helper.env` and backs up an existing file before replacement. It does not edit libvirt XML. `vm-helper.env.example` documents every override. The former `REQUIRED_USB` array remains accepted for compatibility.
+The in-app wizard selects a libvirt domain, reviews a GPU with its companion functions/IOMMU state, reviews attached raw disks, multi-selects the default USB devices for Windows startup, and shows persistence warnings, CPU pinning, and transition timers before writing. Its validated Bash endpoint writes ignored, mode-`0600` `vm-helper.env` and backs up an existing file before replacement. It does not edit libvirt XML. `vm-helper.env.example` documents every override. The former `REQUIRED_USB` array remains accepted for compatibility.
 
 ## Modes
 
@@ -119,7 +121,7 @@ The wizard selects a libvirt domain, reviews a GPU with its companion functions/
 - Inconsistent PCI state, including a stale uevent driver without a sysfs driver link, stops immediately with reboot guidance.
 - NVIDIA module unload failure is a hard stop before libvirt can partially detach a busy GPU.
 - Graceful guest shutdown is the default. The tool never calls `virsh destroy`.
-- GPU transitions, USB mutations, and configuration writes share a non-blocking `flock`; CLI, classic-menu, and TUI operations cannot overlap.
+- GPU transitions, bulk and per-device USB mutations, and configuration writes share a non-blocking `flock`; CLI, classic-menu, and TUI operations cannot overlap. A staged USB batch validates every device before changing any, logs each result, and reports partial failure without attempting an unsafe automatic rollback.
 - The TUI briefly suspends curses for `sudo -v`, then starts the user-owned supervisor described above. Closing the TUI, terminal, or SSH session does not cancel its detached privileged worker, and there is deliberately no unsafe process-cancel action.
 
 ## Runtime Files
@@ -158,7 +160,7 @@ git diff --check
 
 The read-only commands are safe to run from a desktop. GPU and USB ownership commands intentionally mutate machine state and may require sudo. USB attach/detach errors are reported instead of being treated as an assumed already-attached state.
 
-If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw console, commonly `xterm-256color` elsewhere), then use `reset` or the classic menu. `TERM=dumb` intentionally bypasses curses. If a TUI disappears during a transition, relaunch it to reconnect; do not start an opposing direct command while the action lock is active. Press `t` to reopen the most recent Action Terminal. If launch reports that sudo authorization expired, return to the Menu and select the action again to get a fresh prompt. If Validate reports `FAILED`, its output describes a completed read-only check with a failed safety condition, not a transition that is still running.
+If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw console, commonly `xterm-256color` elsewhere), then use `reset` or the classic menu. `TERM=dumb` intentionally bypasses curses. If a TUI disappears during a transition, relaunch it to reconnect to the newest Activity Log; do not start an opposing direct command while the action lock is active. If launch reports that sudo authorization expired, select the action again to get a fresh prompt. If Validate reports `FAILED`, its output describes a completed read-only check with a failed safety condition, not a transition that is still running.
 
 ## Handoff
 

@@ -36,12 +36,12 @@ def write_meta(token: str, pid: int, action: str, status: str, started: int,
     return meta
 
 
-def worker(token: str, action: str, started: int) -> int:
+def worker(token: str, action: str, started: int, arguments: list[str]) -> int:
     directory = runtime_dir()
     log = directory / f"action-{token}.log"
     write_meta(token, os.getpid(), action, "running", started)
     with log.open("a", encoding="utf-8") as handle:
-        handle.write(f"fake {action} started\n")
+        handle.write(f"fake {action} started{' ' + ' '.join(arguments) if arguments else ''}\n")
         handle.flush()
         time.sleep(0.4)
         handle.write("fake action complete\n")
@@ -52,12 +52,13 @@ def worker(token: str, action: str, started: int) -> int:
 def main() -> int:
     args = sys.argv[1:]
     if args[:1] == ["__worker"]:
-        return worker(args[1], args[2], int(args[3]))
+        return worker(args[1], args[2], int(args[3]), args[4:])
     if args[:2] == ["machine", "snapshot"]:
         time.sleep(float(os.environ.get("VM_HELPER_FAKE_DELAY", "0")))
+        vm_state = os.environ.get("VM_HELPER_FAKE_VM_STATE", "shut off")
         sys.stdout.buffer.write(encoded([
             ("snapshot", (int(time.time()),)),
-            ("vm", ("test-windows", "shut off", "qemu:///test", 8, 0, 0, 16 * 1024 * 1024)),
+            ("vm", ("test-windows", vm_state, "qemu:///test", 8, 0, 0, 16 * 1024 * 1024)),
             ("display", ("active",)),
             ("gpu", ("0000:01:00.0", "nvidia", 13, "Fake GPU", "0x10de")),
             ("disk", ("/dev/fake raw disk", "/dev/fake", "yes", "live", "")),
@@ -66,14 +67,19 @@ def main() -> int:
         return 0
     if args[:2] == ["machine", "inventory"]:
         time.sleep(float(os.environ.get("VM_HELPER_FAKE_DELAY", "0")))
+        vm_state = os.environ.get("VM_HELPER_FAKE_VM_STATE", "shut off")
         sys.stdout.buffer.write(encoded([
             ("inventory", (int(time.time()), args[2] if len(args) > 2 else "")),
             ("config", ("/tmp/vm-helper.env", "no", "", "qemu:///test")),
-            ("domain", ("test-windows", "shut off")),
+            ("domain", ("test-windows", vm_state)),
             ("cpu", ("Fake CPU", 8, 1, 4, 2)),
             ("gpu", ("0000:01:00.0", "nvidia", 13, "Fake GPU", "yes", "0x10de")),
             ("companion", ("0000:01:00.0", "0000:01:00.1", "snd_hda_intel", 13, "Fake Audio", "yes")),
             ("usb_inventory", ("Keyboard | safe label", "1234", "abcd", "yes")),
+            ("usb_inventory", ("Mouse", "5678", "ef01", "no")),
+            ("usb_route", ("Keyboard | safe label", "1234", "abcd", "yes", "yes", "Linux", 1)),
+            ("usb_route", ("Mouse", "5678", "ef01", "yes", "no", "Linux", 1)),
+            ("usb_route", ("Missing default", "9999", "0001", "no", "yes", "Missing", 0)),
             ("disk", ("/dev/fake raw disk", "/dev/fake", "yes", "live", "")),
             ("pin", (0, "0-3")),
             ("timer", ("ready_delay", 1)),
@@ -88,7 +94,7 @@ def main() -> int:
         token = f"fake-{time.time_ns()}"; action = args[2]; started = int(time.time())
         log = directory / f"action-{token}.log"; log.touch(mode=0o600)
         process = subprocess.Popen(
-            [sys.executable, __file__, "__worker", token, action, str(started)],
+            [sys.executable, __file__, "__worker", token, action, str(started), *args[3:]],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )

@@ -184,6 +184,36 @@ usb_present() {
   return 1
 }
 
+usb_device_count() {
+  local want_vid="${1,,}" want_pid="${2,,}" dev count=0
+  for dev in /sys/bus/usb/devices/*; do
+    [[ -r "$dev/idVendor" && -r "$dev/idProduct" ]] || continue
+    [[ "$(<"$dev/idVendor")" == "$want_vid" && "$(<"$dev/idProduct")" == "$want_pid" ]] \
+      && ((count += 1))
+  done
+  printf '%s' "$count"
+}
+
+usb_path_is_hub() {
+  local dev="$1" interface
+  [[ "${2:-$(read_file "$dev/bDeviceClass")}" != 09 ]] || return 0
+  for interface in "$dev":*; do
+    [[ -r "$interface/bInterfaceClass" ]] || continue
+    [[ "$(<"$interface/bInterfaceClass")" != 09 ]] || return 0
+  done
+  return 1
+}
+
+usb_id_is_hub() {
+  local want_vid="${1,,}" want_pid="${2,,}" dev
+  for dev in /sys/bus/usb/devices/*; do
+    [[ -r "$dev/idVendor" && -r "$dev/idProduct" ]] || continue
+    [[ "$(<"$dev/idVendor")" == "$want_vid" && "$(<"$dev/idProduct")" == "$want_pid" ]] || continue
+    usb_path_is_hub "$dev" && return 0
+  done
+  return 1
+}
+
 resolve_vm() {
   local output
   local -a domains=()
@@ -611,6 +641,11 @@ usb_xml_file() {
 usb_live_count() {
   local vid="${1,,}" pid="${2,,}" live_xml
   live_xml="$(virsh -c "$URI" dumpxml "$VM")" || die "could not read live XML for $VM"
+  usb_live_count_from_xml "$vid" "$pid" "$live_xml"
+}
+
+usb_live_count_from_xml() {
+  local vid="${1,,}" pid="${2,,}" live_xml="$3"
   xmllint --xpath \
     "count(/domain/devices/hostdev[@type='usb']/source[vendor/@id='0x$vid' and product/@id='0x$pid'])" \
     - 2>/dev/null <<<"$live_xml" || printf '0'
@@ -680,6 +715,62 @@ usb_action() {
     *) _usb_action "$@" ;;
   esac
 }
+
+_usb_route() {
+  local target id vid pid state count label output file live_count
+  local -a targets=() ids=()
+  declare -A seen=()
+  while (($# > 0)); do
+    target="$1"; shift
+    case "$target" in --linux|--windows) ;; *) die "unknown USB routing argument: $target" ;; esac
+    (($# > 0)) || die "$target requires a VID:PID value"
+    id="${1,,}"; shift
+    [[ "$id" =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]] || die "invalid USB VID:PID: $id"
+    [[ "${id%:*}" != 1d6b ]] || die "USB root hubs cannot be routed: $id"
+    [[ -z "${seen[$id]:-}" ]] || die "USB device was assigned more than once: $id"
+    seen[$id]=1; targets+=("${target#--}"); ids+=("$id")
+  done
+  ((${#ids[@]} > 0)) || die "USB routing requires at least one assignment"
+
+  load_runtime_config
+  state="$(required_domstate)"
+  [[ "$state" == running ]] || die "$VM is not running; start Windows before changing live USB ownership"
+
+  for id in "${ids[@]}"; do
+    vid="${id%:*}"; pid="${id#*:}"; count="$(usb_device_count "$vid" "$pid")"
+    usb_id_is_hub "$vid" "$pid" && die "USB hubs cannot be routed: $id"
+    ((count == 1)) || {
+      if ((count == 0)); then die "USB device is not connected: $id"
+      else die "USB device is ambiguous because $count identical devices are connected: $id"; fi
+    }
+  done
+
+  for ((count=0; count<${#ids[@]}; count++)); do
+    id="${ids[$count]}"; target="${targets[$count]}"; vid="${id%:*}"; pid="${id#*:}"
+    label="$(usb_label "$vid" "$pid")"; usb_xml_file "$vid" "$pid"; file="$USB_XML_FILE"
+    live_count="$(usb_live_count "$vid" "$pid")"
+    if [[ "$target" == windows ]]; then
+      if ((live_count > 0)); then
+        log "$label is already routed to Windows"
+      elif output="$(virsh -c "$URI" attach-device "$VM" "$file" --live 2>&1)"; then
+        log "routed $label ($id) to Windows"
+      else
+        [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+        die "failed to route $label ($id) to Windows; earlier changes were retained"
+      fi
+    elif ((live_count == 0)); then
+      log "$label is already routed to Linux"
+    elif output="$(virsh -c "$URI" detach-device "$VM" "$file" --live 2>&1)"; then
+      log "routed $label ($id) to Linux"
+    else
+      [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+      die "failed to route $label ($id) to Linux; earlier changes were retained"
+    fi
+  done
+  udevadm settle --timeout=5 >/dev/null 2>&1 || true
+}
+
+usb_route() { with_mutation_lock _usb_route "$@"; }
 
 hardware_report() {
   local dev bdf class
@@ -828,7 +919,9 @@ usb_is_configured() {
 machine_inventory() {
   local selected_vm="${1:-${VM:-}}" output domain state dev bdf class group label persistent vendor
   local primary companion item vid pid configured model cpu_count sockets cores threads vcpu cpuset
-  local seen_usb='|' config_exists=no
+  local config_exists=no live_xml='' key present owner attached count
+  local -a usb_keys=()
+  declare -A usb_counts=() usb_labels=() usb_defaults=() usb_hubs=()
   need virsh; need xmllint; need lspci; need lscpu
   [[ -f "$CONFIG_FILE" ]] && config_exists=yes
   if [[ -n "$selected_vm" ]]; then
@@ -880,12 +973,46 @@ machine_inventory() {
   for dev in /sys/bus/usb/devices/*; do
     [[ -r "$dev/idVendor" && -r "$dev/idProduct" ]] || continue
     vid="$(<"$dev/idVendor")"; pid="$(<"$dev/idProduct")"; [[ "$vid" != 1d6b ]] || continue
-    [[ "$seen_usb" != *"|$vid:$pid|"* ]] || continue
-    seen_usb+="$vid:$pid|"; label="$(usb_label "$vid" "$pid")"
-    if usb_is_configured "$vid" "$pid"; then configured=yes; else configured=no; fi
-    protocol_record usb_inventory "$label" "$vid" "$pid" "$configured"
+    key="${vid,,}:${pid,,}"
+    usb_counts[$key]="$(( ${usb_counts[$key]:-0} + 1 ))"
+    [[ -n "${usb_labels[$key]:-}" ]] || usb_labels[$key]="$(usb_label "$vid" "$pid")"
+    usb_path_is_hub "$dev" && usb_hubs[$key]=yes
   done
-  for item in "${USB_DEVICES[@]}"; do protocol_record selected_usb "$item"; done
+  for item in "${USB_DEVICES[@]}"; do
+    protocol_record selected_usb "$item"
+    IFS='|' read -r label vid pid <<<"$item"; key="${vid,,}:${pid,,}"
+    usb_defaults[$key]=yes
+    [[ -n "${usb_labels[$key]:-}" ]] || usb_labels[$key]="$label"
+    [[ -n "${usb_counts[$key]:-}" ]] || usb_counts[$key]=0
+  done
+  if [[ -n "$selected_vm" ]]; then
+    state="$(virsh -c "$URI" domstate "$selected_vm" 2>/dev/null || true)"
+    [[ "$state" != running ]] || live_xml="$(virsh -c "$URI" dumpxml "$selected_vm")" \
+      || die "could not read live XML for $selected_vm"
+  fi
+  mapfile -t usb_keys < <(printf '%s\n' "${!usb_counts[@]}" | awk 'NF' | sort)
+  for key in "${usb_keys[@]}"; do
+    vid="${key%:*}"; pid="${key#*:}"; count="${usb_counts[$key]}"
+    if [[ -n "${usb_defaults[$key]:-}" ]]; then configured=yes; else configured=no; fi
+    [[ -z "${usb_hubs[$key]:-}" || "$configured" == yes ]] || continue
+    if ((count > 0)); then
+      present=yes
+      [[ -n "${usb_hubs[$key]:-}" ]] || \
+        protocol_record usb_inventory "${usb_labels[$key]}" "$vid" "$pid" "$configured"
+    else
+      present=no
+    fi
+    attached=0
+    [[ -z "$live_xml" ]] || attached="$(usb_live_count_from_xml "$vid" "$pid" "$live_xml")"
+    if ((attached > 0)); then owner=Windows
+    elif [[ "$present" == yes ]]; then owner=Linux
+    else owner=Missing; fi
+    if [[ -n "${usb_hubs[$key]:-}" ]]; then
+      protocol_record usb_route "${usb_labels[$key]}" "$vid" "$pid" "$present" "$configured" "$owner" "$count" no "USB hub"
+    else
+      protocol_record usb_route "${usb_labels[$key]}" "$vid" "$pid" "$present" "$configured" "$owner" "$count" yes ''
+    fi
+  done
   for item in "${VM_RAW_DISKS[@]}"; do machine_disk_record "$item"; done
 
   if [[ -n "$selected_vm" ]]; then
@@ -1052,10 +1179,11 @@ write_worker_metadata() {
 }
 
 worker_run() {
-  local token="$1" action="$2" dir="$3" owner_uid="$4"
+  local token="$1" action="$2" dir="$3" owner_uid="$4"; shift 4
   [[ "$token" =~ ^[0-9A-Za-z._-]+$ ]] || die "invalid worker token"
-  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|check) ;; *) die "invalid worker action: $action" ;; esac
+  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|usb-route|check) ;; *) die "invalid worker action: $action" ;; esac
   [[ "$dir" == /* && "$owner_uid" =~ ^[0-9]+$ ]] || die "invalid worker runtime identity"
+  [[ "$action" == usb-route || $# == 0 ]] || die "worker action does not accept arguments: $action"
   WORKER_RUNTIME_DIR="$dir"; WORKER_OWNER_UID="$owner_uid"
   ensure_runtime_dir >/dev/null
   case "$action" in
@@ -1064,17 +1192,19 @@ worker_run() {
     linux-windows) start_coexist_mode ;;
     usb-attach) usb_action attach ;;
     usb-detach) usb_action detach ;;
+    usb-route) usb_route "$@" ;;
     check) preflight_report ;;
   esac
 }
 
 worker_supervise() {
-  local token="$1" action="$2" dir="$3" owner_uid="$4" started="$5"
+  local token="$1" action="$2" dir="$3" owner_uid="$4" started="$5"; shift 5
   local start_path log_path meta_path deadline rc=1 status=failed
   [[ "$token" =~ ^[0-9A-Za-z._-]+$ ]] || die "invalid worker token"
-  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|check) ;; *) die "invalid worker action: $action" ;; esac
+  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|usb-route|check) ;; *) die "invalid worker action: $action" ;; esac
   [[ "$dir" == /* && "$owner_uid" =~ ^[0-9]+$ && "$owner_uid" == "$UID" && "$started" =~ ^[0-9]+$ ]] \
     || die "invalid worker supervisor identity"
+  [[ "$action" == usb-route || $# == 0 ]] || die "worker action does not accept arguments: $action"
   WORKER_RUNTIME_DIR="$dir"; WORKER_OWNER_UID="$owner_uid"
   ensure_runtime_dir >/dev/null
   start_path="$dir/action-$token.start"; log_path="$dir/action-$token.log"; meta_path="$dir/action-$token.meta"
@@ -1086,13 +1216,13 @@ worker_supervise() {
   rm -f -- "$start_path"
   if [[ "$action" == check ]]; then
     log "starting detached read-only worker"
-    if setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid"; then rc=0; else rc=$?; fi
+    if setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid" "$@"; then rc=0; else rc=$?; fi
   elif ((EUID == 0)); then
     log "starting detached privileged worker"
-    if setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid"; then rc=0; else rc=$?; fi
+    if setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid" "$@"; then rc=0; else rc=$?; fi
   else
     log "sudo authorized on launcher TTY; starting detached privileged worker"
-    if sudo -n setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid"; then rc=0; else rc=$?; fi
+    if sudo -n setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid" "$@"; then rc=0; else rc=$?; fi
   fi
   ((rc == 0)) && status=complete
   write_worker_metadata "$meta_path" "$token" "$$" "$action" "$status" \
@@ -1101,8 +1231,24 @@ worker_supervise() {
 }
 
 worker_start() {
-  local action="$1" dir token log_path meta_path start_path lock_path pid owner_uid started
-  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|check) ;; *) die "invalid worker action: $action" ;; esac
+  local action="$1"; shift
+  local dir token log_path meta_path start_path lock_path pid owner_uid started
+  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|usb-route|check) ;; *) die "invalid worker action: $action" ;; esac
+  [[ "$action" == usb-route || $# == 0 ]] || die "worker action does not accept arguments: $action"
+  if [[ "$action" == usb-route ]]; then
+    local arg expect_id=0 assignment_count=0
+    for arg in "$@"; do
+      if ((expect_id)); then
+        [[ "${arg,,}" =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]] || die "invalid USB VID:PID: $arg"
+        [[ "${arg,,}" != 1d6b:* ]] || die "USB root hubs cannot be routed: $arg"
+        expect_id=0; ((assignment_count += 1))
+      else
+        [[ "$arg" == --linux || "$arg" == --windows ]] || die "unknown USB routing argument: $arg"
+        expect_id=1
+      fi
+    done
+    ((expect_id == 0 && assignment_count > 0)) || die "USB routing requires complete assignments"
+  fi
   need nohup; need setsid
   if [[ "$action" != check && EUID -ne 0 ]]; then
     need sudo
@@ -1115,7 +1261,7 @@ worker_start() {
   start_path="$dir/action-$token.start"; lock_path="$dir/mutation.lock"
   umask 077; : >"$log_path"; chmod 600 -- "$log_path"
   if [[ "$action" != check ]]; then : >>"$lock_path"; chmod 600 -- "$lock_path"; fi
-  nohup "$SCRIPT_PATH" __worker-supervise "$token" "$action" "$dir" "$owner_uid" "$started" \
+  nohup "$SCRIPT_PATH" __worker-supervise "$token" "$action" "$dir" "$owner_uid" "$started" "$@" \
     </dev/null >>"$log_path" 2>&1 &
   pid=$!
   write_worker_metadata "$meta_path" "$token" "$pid" "$action" running "$started" '' '' "$log_path"
@@ -1184,16 +1330,12 @@ read_main_menu_choice() {
     'Linux'
     'Windows'
     'Linux + Windows'
-    'Status'
-    'Validate configuration'
-    'Discover hardware'
-    'USB status'
-    'USB -> Windows'
-    'USB -> Linux'
-    'Configure this host'
-    'Exit'
+    'Validate'
+    'USB'
+    'Configure'
+    'Quit'
   )
-  local -a values=(1 2 3 4 5 6 7 8 9 10 0)
+  local -a values=(1 2 3 4 5 6 7)
   local selected=0 key suffix next index
 
   printf '\033[s'
@@ -1225,13 +1367,6 @@ read_main_menu_choice() {
         ;;
       [0-9])
         MENU_CHOICE="$key"
-        next=''
-        if IFS= read -rsn1 -t 0.35 next; then
-          if [[ "$key" == 1 && "$next" == 0 ]]; then
-            MENU_CHOICE=10
-            IFS= read -rsn1 -t 0.35 next || true
-          fi
-        fi
         return 0
         ;;
       k) selected=$(((selected - 1 + ${#labels[@]}) % ${#labels[@]})) ;;
@@ -1239,6 +1374,21 @@ read_main_menu_choice() {
       *) continue ;;
     esac
     printf '\033[u\033[J'
+  done
+}
+
+interactive_usb_menu() {
+  local answer
+  while true; do
+    printf '\nLive USB\n  1) Status\n  2) Configured devices -> Windows\n  3) Configured devices -> Linux\n  4) Back\nSelection: '
+    read -r answer
+    case "$answer" in
+      1) run_menu_action usb_action status ;;
+      2) if confirm 'Attach configured USB devices to Windows?'; then run_menu_action usb_action attach; fi ;;
+      3) if confirm 'Detach configured USB devices back to Linux?'; then run_menu_action usb_action detach; fi ;;
+      4|'') return 0 ;;
+      *) printf 'Enter a number from 1 to 4.\n' ;;
+    esac
   done
 }
 
@@ -1252,14 +1402,10 @@ interactive_menu() {
       1) if confirm 'Shut down the VM, return its devices to Linux, and start the desktop?'; then run_menu_action return_linux_mode; fi ;;
       2) if confirm 'Start Windows with the selected devices and leave Linux at TTY?'; then run_menu_action start_windows_mode; fi ;;
       3) if confirm 'Start Windows with the selected devices, then start the Linux desktop?'; then run_menu_action start_coexist_mode; fi ;;
-      4) run_menu_action status_report ;;
-      5) run_menu_action preflight_report ;;
-      6) run_menu_action hardware_report ;;
-      7) run_menu_action usb_action status ;;
-      8) if confirm 'Attach configured USB devices to the VM?'; then run_menu_action usb_action attach; fi ;;
-      9) if confirm 'Detach configured USB devices back to Linux?'; then run_menu_action usb_action detach; fi ;;
-      10) run_menu_action configure_interactive ;;
-      0) return 0 ;;
+      4) run_menu_action preflight_report ;;
+      5) interactive_usb_menu ;;
+      6) run_menu_action configure_interactive ;;
+      7|0) return 0 ;;
       *) printf 'Unknown selection.\n' ;;
     esac
   done
@@ -1304,19 +1450,22 @@ dispatch() {
         snapshot) machine_snapshot ;;
         inventory) machine_inventory "${3:-}" ;;
         configure) shift 2; internal_configure "$@" ;;
-        worker-start) [[ -n "${3:-}" ]] || die 'worker-start requires an action'; worker_start "$3" ;;
+        worker-start)
+          [[ -n "${3:-}" ]] || die 'worker-start requires an action'
+          command="$3"; shift 3; worker_start "$command" "$@"
+          ;;
         *) die "unknown machine endpoint: ${2:-}" ;;
       esac
       ;;
     __worker-supervise)
       [[ -n "${2:-}" && -n "${3:-}" && -n "${4:-}" && -n "${5:-}" && -n "${6:-}" ]] \
         || die 'invalid worker supervisor invocation'
-      worker_supervise "$2" "$3" "$4" "$5" "$6"
+      worker_supervise "$2" "$3" "$4" "$5" "$6" "${@:7}"
       ;;
     __worker-run)
       [[ -n "${2:-}" && -n "${3:-}" && -n "${4:-}" && -n "${5:-}" ]] \
         || die 'invalid worker invocation'
-      worker_run "$2" "$3" "$4" "$5"
+      worker_run "$2" "$3" "$4" "$5" "${@:6}"
       ;;
     help|-h|--help) usage ;;
     *) usage >&2; die "unknown command: $command" ;;

@@ -148,6 +148,61 @@ if (write_config >/dev/null 2>&1); then
 fi
 wait "$lock_holder_pid"
 
+usb_counts_for_test=1
+usb_device_count() { printf '%s' "$usb_counts_for_test"; }
+usb_label() { printf 'Test USB %s:%s' "$1" "$2"; }
+USB_XML_FILE="$test_tmp/device.xml"
+usb_xml_file() { printf '<hostdev/>\n' >"$USB_XML_FILE"; }
+usb_live_count() {
+  [[ "$1:$2" == 5678:ef01 ]] && printf 1 || printf 0
+}
+route_calls_file="$test_tmp/usb-route-calls"
+: >"$route_calls_file"
+fail_route_id=''
+virsh() {
+  case "$*" in
+    *' attach-device '*)
+      printf 'attach %s\n' "$*" >>"$route_calls_file"
+      [[ -z "$fail_route_id" || "$(<"$USB_XML_FILE")" != *"$fail_route_id"* ]]
+      ;;
+    *' detach-device '*)
+      printf 'detach %s\n' "$*" >>"$route_calls_file"
+      [[ -z "$fail_route_id" || "$(<"$USB_XML_FILE")" != *"$fail_route_id"* ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+udevadm() { :; }
+_usb_route --windows 1234:abcd --linux 5678:ef01 >"$test_tmp/usb-route.log"
+route_output="$(<"$test_tmp/usb-route.log")"
+[[ "$route_output" == *'routed Test USB 1234:abcd (1234:abcd) to Windows'* ]] \
+  || fail 'per-device USB route did not attach the Windows target'
+[[ "$route_output" == *'routed Test USB 5678:ef01 (5678:ef01) to Linux'* ]] \
+  || fail 'per-device USB route did not detach the Linux target'
+assert_equal "$(wc -l <"$route_calls_file")" 2
+usb_xml_file() { printf '%s:%s\n' "$1" "$2" >"$USB_XML_FILE"; }
+: >"$route_calls_file"
+fail_route_id=5678:ef01
+if (_usb_route --windows 1234:abcd --linux 5678:ef01 >"$test_tmp/usb-route-partial.log" 2>&1); then
+  fail 'per-device USB route hid an operational batch failure'
+fi
+grep -q 'routed Test USB 1234:abcd (1234:abcd) to Windows' "$test_tmp/usb-route-partial.log" \
+  || fail 'USB batch did not retain and report its earlier successful route'
+grep -q 'earlier changes were retained' "$test_tmp/usb-route-partial.log" \
+  || fail 'USB batch failure did not explain its partial result'
+fail_route_id=''
+usb_counts_for_test=2
+if (_usb_route --windows 1234:abcd >/dev/null 2>&1); then
+  fail 'per-device USB route accepted an ambiguous duplicate VID:PID'
+fi
+usb_counts_for_test=1
+if (_usb_route --windows invalid >/dev/null 2>&1); then
+  fail 'per-device USB route accepted an invalid VID:PID'
+fi
+if (_usb_route --windows 1d6b:0003 >/dev/null 2>&1); then
+  fail 'per-device USB route accepted a Linux root hub'
+fi
+
 original_script_path="$SCRIPT_PATH"
 supervisor_dir="$(ensure_runtime_dir)"
 success_token=supervisor-success
@@ -170,6 +225,16 @@ if worker_supervise "$failure_token" linux-windows "$supervisor_dir" "$UID" 200 
 fi
 assert_equal "${SUDO_CALLS[0]}" "-n setsid /usr/bin/false __worker-run $failure_token linux-windows $supervisor_dir $UID"
 
+route_token=supervisor-route
+route_log="$supervisor_dir/action-$route_token.log"
+: >"$route_log"
+: >"$supervisor_dir/action-$route_token.start"
+SCRIPT_PATH=/usr/bin/true
+SUDO_CALLS=()
+worker_supervise "$route_token" usb-route "$supervisor_dir" "$UID" 300 --windows 1234:abcd >/dev/null
+assert_equal "${SUDO_CALLS[0]}" \
+  "-n setsid /usr/bin/true __worker-run $route_token usb-route $supervisor_dir $UID --windows 1234:abcd"
+
 SCRIPT_PATH=/usr/bin/true
 SUDO_CALLS=()
 worker_start linux-windows >"$test_tmp/worker-start.bin"
@@ -177,6 +242,9 @@ assert_equal "${SUDO_CALLS[0]}" '-n true'
 SUDO_CALLS=()
 worker_start check >"$test_tmp/check-start.bin"
 assert_equal "${#SUDO_CALLS[@]}" 0
+if (worker_start usb-route --windows invalid >/dev/null 2>&1); then
+  fail 'USB route worker accepted an invalid VID:PID'
+fi
 
 PYTHONPATH="$ROOT" python3 - "$supervisor_dir" "$test_tmp/worker-start.bin" "$test_tmp/check-start.bin" <<'PY'
 import os
@@ -187,9 +255,12 @@ from vm_helper_tui.protocol import parse_records
 directory = Path(sys.argv[1])
 success = parse_records((directory / "action-supervisor-success.meta").read_bytes())[0].fields
 failure = parse_records((directory / "action-supervisor-failure.meta").read_bytes())[0].fields
+route = parse_records((directory / "action-supervisor-route.meta").read_bytes())[0].fields
 assert success[3] == "complete" and success[4] == "100" and success[6] == "0"
 assert failure[3] == "failed" and failure[4] == "200" and failure[6] == "1"
-for path in (directory / "action-supervisor-success.meta", directory / "action-supervisor-failure.meta"):
+assert route[2] == "usb-route" and route[3] == "complete" and route[6] == "0"
+for path in (directory / "action-supervisor-success.meta", directory / "action-supervisor-failure.meta",
+             directory / "action-supervisor-route.meta"):
     assert path.stat().st_mode & 0o777 == 0o600
     assert path.stat().st_uid == os.getuid()
 for payload, action in ((Path(sys.argv[2]).read_bytes(), "linux-windows"),

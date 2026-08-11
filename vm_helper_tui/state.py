@@ -12,22 +12,30 @@ from .telemetry import Histories, HostSample, VmRates, derive_mode
 
 
 @dataclass(frozen=True)
-class ActionSpec:
+class MenuSpec:
     label: str
-    worker_action: str
     hotkey: str
-    mutating: bool
-    confirmation: str
+    kind: str
+    worker_action: str = ""
+    mutating: bool = False
+    confirmation: str = ""
 
 
-ACTIONS = (
-    ActionSpec("Linux", "linux", "l", True, "Return devices to Linux and start the desktop?"),
-    ActionSpec("Windows", "windows", "w", True, "Start Windows and leave Linux at TTY?"),
-    ActionSpec("Linux + Windows", "linux-windows", "b", True, "Start Windows and the Linux desktop?"),
-    ActionSpec("Validate", "check", "v", False, "Run the read-only transition preflight?"),
-    ActionSpec("USB -> Windows", "usb-attach", "u", True, "Attach configured USB devices to Windows?"),
-    ActionSpec("USB -> Linux", "usb-detach", "d", True, "Detach configured USB devices to Linux?"),
+MENU_ITEMS = (
+    MenuSpec("Linux", "l", "worker", "linux", True, "Return devices to Linux and start the desktop?"),
+    MenuSpec("Windows", "w", "worker", "windows", True, "Start Windows and leave Linux at TTY?"),
+    MenuSpec("Linux + Windows", "b", "worker", "linux-windows", True, "Start Windows and the Linux desktop?"),
+    MenuSpec("Validate", "v", "worker", "check", False, "Run the read-only transition preflight?"),
+    MenuSpec("USB", "u", "usb"),
+    MenuSpec("Configure", "c", "configure"),
+    MenuSpec("Quit", "q", "quit"),
 )
+
+
+def action_label(action: str) -> str:
+    if action == "usb-route":
+        return "USB routing"
+    return next((item.label for item in MENU_ITEMS if item.worker_action == action), action)
 
 
 @dataclass(frozen=True)
@@ -39,16 +47,16 @@ class PanelSpec:
 
 
 PANEL_REGISTRY = (
-    PanelSpec("actions", "Menu", 10, "Overview"),
+    PanelSpec("menu", "Menu", 10, "Overview"),
     PanelSpec("host", "Host", 20, "Overview"),
     PanelSpec("vm", "Virtual Machine", 30, "Overview"),
     PanelSpec("gpu_io", "GPU / I/O", 40, "GPU / I/O"),
     PanelSpec("usb", "USB", 50, "USB"),
-    PanelSpec("logs", "Action Log", 60, "Logs"),
+    PanelSpec("logs", "Activity Log", 60, "Activity"),
 )
 COMPACT_TABS = tuple(dict.fromkeys(panel.compact_tab for panel in PANEL_REGISTRY))
 DEFAULT_LAYOUT_PROFILE = {
-    "large_columns": (("actions", "host", "usb"), ("vm", "gpu_io", "logs")),
+    "large_columns": (("menu", "host", "usb"), ("vm", "gpu_io", "logs")),
     "compact_tabs": COMPACT_TABS,
 }
 
@@ -103,16 +111,42 @@ def map_key(key: int) -> str | None:
         ord("j"): "down",
         ord("k"): "up",
         ord("r"): "refresh",
-        ord("c"): "configure",
-        ord("t"): "terminal_log",
+        ord("a"): "apply",
         ord("["): "log_up",
         ord("]"): "log_down",
         ord(" "): "toggle",
     }
-    for index, action in enumerate(ACTIONS, 1):
-        mapping[ord(str(index))] = f"action:{index - 1}"
-        mapping[ord(action.hotkey)] = f"action:{index - 1}"
+    for index, item in enumerate(MENU_ITEMS, 1):
+        mapping[ord(str(index))] = f"menu:{index - 1}"
+        if item.kind != "quit":
+            mapping[ord(item.hotkey)] = f"menu:{index - 1}"
     return mapping.get(key)
+
+
+@dataclass(frozen=True)
+class UsbRoute:
+    label: str
+    vid: str
+    pid: str
+    present: bool
+    configured: bool
+    owner: str
+    count: int
+    blocked_reason: str = ""
+
+    @property
+    def usb_id(self) -> str:
+        return f"{self.vid}:{self.pid}"
+
+    @property
+    def unavailable_reason(self) -> str:
+        if self.blocked_reason:
+            return self.blocked_reason
+        if not self.present:
+            return "device is missing"
+        if self.count != 1:
+            return f"{self.count} identical devices are connected"
+        return ""
 
 
 @dataclass
@@ -122,6 +156,7 @@ class Inventory:
     gpus: list[tuple[str, ...]] = field(default_factory=list)
     companions: dict[str, list[tuple[str, ...]]] = field(default_factory=dict)
     usb: list[tuple[str, ...]] = field(default_factory=list)
+    usb_routes: list[UsbRoute] = field(default_factory=list)
     disks: list[tuple[str, ...]] = field(default_factory=list)
     pins: list[tuple[str, str]] = field(default_factory=list)
     timers: dict[str, str] = field(default_factory=dict)
@@ -137,6 +172,14 @@ class Inventory:
             if len(item) >= 6:
                 self.companions.setdefault(item[0], []).append(item)
         self.usb = [item for item in grouped.get("usb_inventory", []) if len(item) >= 4]
+        self.usb_routes = [
+            UsbRoute(
+                label=item[0], vid=item[1], pid=item[2], present=item[3] == "yes",
+                configured=item[4] == "yes", owner=item[5], count=max(0, int(item[6])),
+                blocked_reason=item[8] if len(item) >= 9 and item[7] != "yes" else "",
+            )
+            for item in grouped.get("usb_route", []) if len(item) >= 7 and item[6].isdigit()
+        ]
         self.disks = [item for item in grouped.get("disk", []) if len(item) >= 5]
         self.pins = [(item[0], item[1]) for item in grouped.get("pin", []) if len(item) >= 2]
         self.timers = {item[0]: item[1] for item in grouped.get("timer", []) if len(item) >= 2}
@@ -152,10 +195,9 @@ class DashboardState:
     histories: Histories = field(default_factory=Histories)
     error: str = ""
     notice: str = ""
-    selected_action: int = 0
+    selected_menu: int = 0
     tab: int = 0
     log_scroll: int = 0
-    terminal_log: bool = False
     last_dynamic: float = 0.0
     last_static: float = 0.0
 
@@ -182,11 +224,71 @@ class DashboardState:
         self.error = ""
         self.last_dynamic = time.monotonic()
 
-    def move_action(self, delta: int) -> None:
-        self.selected_action = (self.selected_action + delta) % len(ACTIONS)
+    def move_menu(self, delta: int) -> None:
+        self.selected_menu = (self.selected_menu + delta) % len(MENU_ITEMS)
 
     def move_tab(self, delta: int) -> None:
         self.tab = (self.tab + delta) % len(COMPACT_TABS)
+
+
+@dataclass
+class UsbPageState:
+    cursor: int = 0
+    desired: dict[str, str] = field(default_factory=dict)
+    message: str = ""
+
+    def sync(self, inventory: Inventory) -> None:
+        ids = {route.usb_id for route in inventory.usb_routes if not route.unavailable_reason}
+        self.desired = {usb_id: owner for usb_id, owner in self.desired.items() if usb_id in ids}
+        if inventory.usb_routes:
+            self.cursor = min(self.cursor, len(inventory.usb_routes) - 1)
+        else:
+            self.cursor = 0
+
+    def move(self, delta: int, inventory: Inventory) -> None:
+        count = len(inventory.usb_routes)
+        self.cursor = (self.cursor + delta) % count if count else 0
+        self.message = ""
+
+    def selected(self, inventory: Inventory) -> UsbRoute | None:
+        if not inventory.usb_routes:
+            return None
+        return inventory.usb_routes[min(self.cursor, len(inventory.usb_routes) - 1)]
+
+    def target(self, route: UsbRoute) -> str:
+        return self.desired.get(route.usb_id, route.owner)
+
+    def set_target(self, target: str, inventory: Inventory, vm_running: bool) -> bool:
+        route = self.selected(inventory)
+        if route is None:
+            self.message = "No USB devices are available."
+            return False
+        if route.unavailable_reason:
+            self.message = f"{route.usb_id}: {route.unavailable_reason}."
+            return False
+        if target == "Windows" and not vm_running:
+            self.message = "Start Windows before routing a USB device to it."
+            return False
+        if target not in ("Linux", "Windows"):
+            return False
+        if target == route.owner:
+            self.desired.pop(route.usb_id, None)
+        else:
+            self.desired[route.usb_id] = target
+        self.message = ""
+        return True
+
+    def toggle(self, inventory: Inventory, vm_running: bool) -> bool:
+        route = self.selected(inventory)
+        target = "Windows" if route and self.target(route) == "Linux" else "Linux"
+        return self.set_target(target, inventory, vm_running)
+
+    def changes(self, inventory: Inventory) -> list[tuple[str, str]]:
+        return [
+            (route.usb_id, target)
+            for route in inventory.usb_routes
+            if (target := self.desired.get(route.usb_id)) and target != route.owner
+        ]
 
 
 WIZARD_STEPS = ("Domain", "GPU", "Raw disks", "USB", "Review", "Write")

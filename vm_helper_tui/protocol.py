@@ -178,8 +178,8 @@ class Backend:
             args.extend(("--usb", usb_id))
         return self._call(args, timeout=15.0)
 
-    def start_worker(self, action: str) -> list[Record]:
-        return self._call(["machine", "worker-start", action])
+    def start_worker(self, action: str, arguments: Iterable[str] = ()) -> list[Record]:
+        return self._call(["machine", "worker-start", action, *arguments])
 
 
 def default_runtime_dir() -> Path:

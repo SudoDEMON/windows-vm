@@ -24,7 +24,8 @@ def set_size(fd: int, rows: int, columns: int) -> None:
 
 class PtyIntegrationTests(unittest.TestCase):
     def run_tui(self, term: str, rows: int, columns: int, fake_delay: float = 0,
-                max_quit_latency: float | None = None, launch_action: bool = False) -> bytes:
+                max_quit_latency: float | None = None, launch_action: bool = False,
+                route_usb: bool = False) -> bytes:
         master, slave = pty.openpty()
         set_size(slave, rows, columns)
         before = termios.tcgetattr(slave)
@@ -33,8 +34,15 @@ class PtyIntegrationTests(unittest.TestCase):
         environment.pop("VM_HELPER_FAKE_DELAY", None)
         if fake_delay:
             environment["VM_HELPER_FAKE_DELAY"] = str(fake_delay)
+        if route_usb:
+            environment["VM_HELPER_FAKE_VM_STATE"] = "running"
         with tempfile.TemporaryDirectory() as runtime:
             environment["XDG_RUNTIME_DIR"] = runtime
+            if route_usb:
+                fake_bin = Path(runtime) / "bin"
+                fake_bin.mkdir()
+                os.symlink("/usr/bin/true", fake_bin / "sudo")
+                environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
 
             def child_setup() -> None:
                 os.setsid()
@@ -59,6 +67,21 @@ class PtyIntegrationTests(unittest.TestCase):
                     time.sleep(0.1)
                     os.write(master, b"y")
                     time.sleep(0.8)
+                    os.write(master, b"jk")
+                    time.sleep(0.1)
+                    os.write(master, b"\t\t\t")
+                    time.sleep(0.2)
+                elif route_usb:
+                    os.write(master, b"5")
+                    time.sleep(0.5)
+                    os.write(master, b" ")
+                    time.sleep(0.1)
+                    os.write(master, b"a")
+                    time.sleep(0.1)
+                    os.write(master, b"y")
+                    time.sleep(0.8)
+                    os.write(master, b"q")
+                    time.sleep(0.1)
                 else:
                     os.write(master, b"\t")
                     time.sleep(0.2)
@@ -111,14 +134,26 @@ class PtyIntegrationTests(unittest.TestCase):
     def test_quit_remains_responsive_during_slow_telemetry(self) -> None:
         self.run_tui("xterm-256color", 24, 80, fake_delay=2.0, max_quit_latency=0.8)
 
-    def test_action_opens_live_terminal_log(self) -> None:
+    def test_action_stays_on_dashboard_and_streams_activity(self) -> None:
         output = self.run_tui("xterm-256color", 24, 80, launch_action=True)
         decoded = output.decode("utf-8", "replace")
-        self.assertIn("ACTION TERMINAL", decoded)
-        self.assertIn("$ vm-helper check", decoded)
+        self.assertNotIn("ACTION TERMINAL", decoded)
+        self.assertIn("Activity", decoded)
+        self.assertIn("Configure", decoded)
+        self.assertIn("Quit", decoded)
         self.assertIn("fake check started", decoded)
         self.assertIn("fake action complete", decoded)
         self.assertIn("Validate: SUCCEEDED", decoded)
+        self.assertIn("Validate SUCCEEDED; see Activity Log for details", decoded)
+        self.assertIn("PgUp/PgDn activity", decoded)
+
+    def test_usb_page_stages_and_runs_live_routing(self) -> None:
+        output = self.run_tui("xterm-256color", 40, 140, route_usb=True)
+        decoded = output.decode("utf-8", "replace")
+        self.assertIn("LIVE USB ROUTING", decoded)
+        self.assertIn("Missing default", decoded)
+        self.assertIn("fake usb-route started --windows 1234:abcd", decoded)
+        self.assertIn("Activity Log", decoded)
 
     def test_classic_environment_fallback_exits_cleanly(self) -> None:
         master, slave = pty.openpty()

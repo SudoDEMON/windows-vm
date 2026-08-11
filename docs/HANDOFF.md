@@ -39,7 +39,9 @@ The validated internal configuration endpoint accepts exactly one VM, one displa
 
 `vm-helper machine snapshot` and `machine inventory [VM]` emit a `VMH1\0` header followed by typed records, decimal field counts, and NUL-terminated fields. Never replace this with parsing the human `status` or `hardware` output. Additive record types are compatible; changing field meaning requires a protocol version bump and parser tests.
 
-The panel registry and default profile intentionally make layout order/visibility data-driven, but v1 exposes no customization UI or persistent layout file.
+The panel registry and default profile intentionally make layout order/visibility data-driven, but v1 exposes no customization UI or persistent layout file. Dashboard actions never replace the dashboard with a terminal view: detached output remains in Activity Log, while USB and Configure are explicit full pages within the same curses session.
+
+The live USB page consumes additive `usb_route` inventory records. Each record includes label, VID, PID, presence, default-configuration membership, live owner, and physical match count. The page stages Linux/Windows targets and submits one `usb-route` worker with repeated validated `--linux VID:PID` or `--windows VID:PID` pairs. Direct bulk `usb attach` and `usb detach` commands remain compatible.
 
 ## Operational Invariants
 
@@ -55,6 +57,7 @@ The panel registry and default profile intentionally make layout order/visibilit
 - The display manager starts only after the returned GPU has a host driver and vendor health checks pass.
 - Guest shutdown remains graceful; no helper uses `virsh destroy`.
 - All GPU, USB, and configuration mutations enter the same `flock`, including nested coexist/USB paths.
+- Per-device USB batches reject missing devices, duplicate VID:PID assignments, Linux root hubs, and ambiguous identical devices before the first mutation. Operational failures may leave earlier requested routes applied; log that partial result and do not add automatic rollback.
 - TUI privileged workers are detached session leaders watched by unprivileged supervisors. Supervisors atomically maintain user-owned binary metadata and text logs below `$XDG_RUNTIME_DIR/vm-helper/` with mode `0600`; closing curses must never signal or cancel them.
 
 ## Vendor Behavior
@@ -76,17 +79,17 @@ If an NVIDIA module cannot reload after a rolling-release update, compare the ru
 
 If VM startup reports a selected PCI function is not persistent, add that function to the inactive libvirt domain as a managed PCI hostdev before retrying.
 
-If USB attachment is ambiguous because multiple identical VID:PID devices are connected, use persistent VM XML with explicit USB source addressing or extend the local configuration model before relying on live VID:PID attachment.
+If USB attachment is ambiguous because multiple identical VID:PID devices are connected, the live page shows the duplicate count and disables routing. Use persistent VM XML with explicit USB source addressing or extend the local configuration model before relying on live VID:PID attachment.
 
 If the TUI cannot initialize, use `classic-menu`, `configure-classic`, or `VM_HELPER_TUI=0`. `TERM=dumb` bypasses curses automatically. A raw Linux console should use `TERM=linux`; mouse reporting is optional there.
 
 If a transition outlives its terminal, relaunch the dashboard to reconnect to the newest active action. A stale metadata record is not treated as an active lock: the Bash `flock` remains the authority. Never add force-kill UI for transition workers.
 
-Dynamic snapshots and static inventory run as separate pollable subprocess groups; they must never block `getch()`. Dashboard exit may terminate those read-only collectors, but it must not signal detached transition workers. Starting an action opens the full-screen Action Terminal over the same reconnectable log; `t`/Esc returns to the dashboard. Metadata state plus return code must remain visible after its PID exits.
+Dynamic snapshots and static inventory run as separate pollable subprocess groups; they must never block `getch()`. Dashboard exit may terminate those read-only collectors, but it must not signal detached transition workers. Starting an action keeps the menu active and streams the same reconnectable log into Activity Log. Metadata state plus return code must remain visible after its PID exits.
 
 ## Validation Additions
 
-`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, shared mutation locking, sudo-before-`setsid` worker supervision, user-owned completion metadata, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, the live Action Terminal, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
+`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, per-device USB safety, shared mutation locking, sudo-before-`setsid` worker supervision, user-owned completion metadata, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard/USB page state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, dashboard Activity Log streaming, staged USB routing, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
 
 ## Repository Hygiene
 

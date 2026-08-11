@@ -11,7 +11,7 @@ import subprocess
 import time
 
 from .protocol import ActionInfo, ActionStore, Backend, BackendError, PendingCall, records_by_kind
-from .state import ACTIONS, COMPACT_TABS, DashboardState, WizardState, map_key, map_mouse
+from .state import MENU_ITEMS, DashboardState, UsbPageState, WizardState, action_label, map_key, map_mouse
 from .telemetry import HostCollector, VmDeltaTracker
 from .views import Renderer
 
@@ -26,7 +26,9 @@ class Application:
         self.state = DashboardState()
         self.renderer = Renderer(screen)
         self.wizard = WizardState() if mode == "configure" else None
+        self.usb_page: UsbPageState | None = None
         self.pending_action: int | None = None
+        self.pending_usb: list[tuple[str, str]] | None = None
         self.current_action: ActionInfo | None = None
         self.dynamic_call: PendingCall | None = None
         self.static_call: PendingCall | None = None
@@ -72,6 +74,8 @@ class Application:
                 return
             self.static_call = None
             self.state.inventory.update(records)
+            if self.usb_page:
+                self.usb_page.sync(self.state.inventory)
             self.state.last_static = time.monotonic()
             if self.wizard and self.wizard.vm and not self.wizard.usb_ids:
                 self.wizard.usb_ids = {
@@ -102,15 +106,11 @@ class Application:
                 self.state.last_static = now
             self.force_static = False
 
-    @staticmethod
-    def _action_label(action: str) -> str:
-        return next((spec.label for spec in ACTIONS if spec.worker_action == action), action)
-
     def _action_notice(self, action: ActionInfo) -> str:
-        label = self._action_label(action.action)
+        label = action_label(action.action)
         if action.active:
-            return f"{label} is RUNNING (PID {action.pid}); Action Log updates live"
-        return f"{label} {action.status_text}; see Action Log for details"
+            return f"{label} is RUNNING (PID {action.pid}); Activity Log updates live"
+        return f"{label} {action.status_text}; see Activity Log for details"
 
     def refresh_action(self) -> None:
         self.current_action = self.actions.current()
@@ -129,6 +129,7 @@ class Application:
             self.state.notice = self._action_notice(self.current_action)
         elif previous[1] == "running" and marker[1] != "running":
             self.state.notice = self._action_notice(self.current_action)
+            self.force_dynamic = self.force_static = True
         self.action_marker = marker
 
     def loop(self) -> None:
@@ -136,23 +137,32 @@ class Application:
             while self.running:
                 self.refresh_telemetry()
                 self.refresh_action()
-                modal = ACTIONS[self.pending_action].confirmation if self.pending_action is not None else ""
+                if self.pending_action is not None:
+                    modal = MENU_ITEMS[self.pending_action].confirmation
+                elif self.pending_usb is not None:
+                    modal = f"Apply {len(self.pending_usb)} staged USB ownership change(s)?"
+                else:
+                    modal = ""
                 self.renderer.render(
                     self.state,
                     self.current_action,
                     self.logs,
                     self.wizard,
+                    self.usb_page,
                     modal,
-                    self.state.terminal_log,
                 )
                 key = self.screen.getch()
                 if key == -1:
                     continue
-                if self.pending_action is not None:
+                if self.pending_action is not None or self.pending_usb is not None:
                     if key in (ord("y"), ord("Y")):
-                        self.confirm_pending()
+                        if self.pending_usb is not None:
+                            self.confirm_usb()
+                        else:
+                            self.confirm_pending()
                     elif key in (ord("n"), ord("N"), 27, ord("q")):
                         self.pending_action = None
+                        self.pending_usb = None
                     continue
                 command = self._command_for_key(key)
                 if command:
@@ -175,15 +185,15 @@ class Application:
         if self.wizard is not None:
             self._handle_wizard(command)
             return
-        if self.state.terminal_log:
-            self._handle_terminal_log(command)
+        if self.usb_page is not None:
+            self._handle_usb_page(command)
             return
         if command in ("quit", "escape"):
             self.running = False
         elif command == "up":
-            self.state.move_action(-1)
+            self.state.move_menu(-1)
         elif command == "down":
-            self.state.move_action(1)
+            self.state.move_menu(1)
         elif command == "next_tab":
             self.state.move_tab(1)
         elif command == "previous_tab":
@@ -191,22 +201,14 @@ class Application:
         elif command.startswith("tab:"):
             self.state.tab = int(command.split(":", 1)[1])
         elif command == "activate":
-            self._request_action(self.state.selected_action)
-        elif command.startswith("action:"):
+            self._activate_menu(self.state.selected_menu)
+        elif command.startswith("menu:"):
             index = int(command.split(":", 1)[1])
-            self.state.selected_action = index
-            self._request_action(index)
+            self.state.selected_menu = index
+            self._activate_menu(index)
         elif command == "refresh":
             self.force_dynamic = self.force_static = True
             self.state.notice = "Refreshing telemetry and hardware inventory"
-        elif command == "configure":
-            if self.current_action and self.current_action.active:
-                self.state.notice = "Configuration is disabled while an action is active"
-            else:
-                self.wizard = WizardState()
-                self.force_static = True
-        elif command == "terminal_log":
-            self.state.terminal_log = True
         elif command == "log_up":
             self.state.log_scroll = min(max(0, len(self.logs) - 1), self.state.log_scroll + 5)
         elif command == "log_down":
@@ -214,27 +216,25 @@ class Application:
         elif command == "resize":
             self.screen.erase()
 
-    def _handle_terminal_log(self, command: str) -> None:
-        if command == "quit":
+    def _activate_menu(self, index: int) -> None:
+        if not 0 <= index < len(MENU_ITEMS):
+            return
+        spec = MENU_ITEMS[index]
+        if spec.kind == "quit":
             self.running = False
-        elif command in ("escape", "terminal_log"):
-            self.state.terminal_log = False
-        elif command in ("log_up", "up"):
-            amount = 1 if command == "up" else 5
-            self.state.log_scroll = min(max(0, len(self.logs) - 1), self.state.log_scroll + amount)
-        elif command in ("log_down", "down"):
-            amount = 1 if command == "down" else 5
-            self.state.log_scroll = max(0, self.state.log_scroll - amount)
-        elif command == "resize":
-            self.screen.erase()
-
-    def _request_action(self, index: int) -> None:
-        if not 0 <= index < len(ACTIONS):
             return
         if self.current_action and self.current_action.active:
-            self.state.notice = "An action is active; conflicting actions are disabled"
+            self.state.notice = "An action is active; conflicting actions and pages are disabled"
             return
-        self.pending_action = index
+        if spec.kind == "worker":
+            self.pending_action = index
+        elif spec.kind == "configure":
+            self.wizard = WizardState()
+            self.force_static = True
+        elif spec.kind == "usb":
+            self.usb_page = UsbPageState()
+            self.usb_page.sync(self.state.inventory)
+            self.force_dynamic = self.force_static = True
 
     def _authorize_sudo(self) -> bool:
         if os.geteuid() == 0:
@@ -258,7 +258,7 @@ class Application:
     def confirm_pending(self) -> None:
         if self.pending_action is None:
             return
-        spec = ACTIONS[self.pending_action]
+        spec = MENU_ITEMS[self.pending_action]
         self.pending_action = None
         if spec.mutating and not self._authorize_sudo():
             self.state.error = "sudo authorization was cancelled; no action was started"
@@ -269,14 +269,89 @@ class Application:
             self.state.notice = f"Detached {spec.label} action started (PID {worker[1] if len(worker) > 1 else '?'})"
             self.state.error = ""
             self.state.log_scroll = 0
-            self.state.tab = COMPACT_TABS.index("Logs")
-            self.state.terminal_log = True
             if len(worker) > 1:
                 self.action_marker = (worker[0], "running", None)
             self.refresh_action()
             self.force_dynamic = True
         except BackendError as exc:
             self.state.error = str(exc)
+
+    def _handle_usb_page(self, command: str) -> None:
+        assert self.usb_page is not None
+        if command in ("quit", "escape"):
+            self.usb_page = None
+            return
+        if command == "up":
+            self.usb_page.move(-1, self.state.inventory)
+        elif command == "down":
+            self.usb_page.move(1, self.state.inventory)
+        elif command == "previous_tab":
+            self._set_usb_target("Linux")
+        elif command == "next_tab":
+            self._set_usb_target("Windows")
+        elif command == "toggle":
+            if self.current_action and self.current_action.active:
+                self.usb_page.message = "USB changes are disabled while an action is active."
+            else:
+                self.usb_page.toggle(self.state.inventory, self.state.vm[1] == "running")
+        elif command in ("activate", "apply"):
+            self._request_usb_apply()
+        elif command == "refresh":
+            self.force_dynamic = self.force_static = True
+            self.usb_page.message = "Refreshing USB ownership"
+        elif command == "resize":
+            self.screen.erase()
+
+    def _set_usb_target(self, target: str) -> None:
+        assert self.usb_page is not None
+        if self.current_action and self.current_action.active:
+            self.usb_page.message = "USB changes are disabled while an action is active."
+            return
+        self.usb_page.set_target(target, self.state.inventory, self.state.vm[1] == "running")
+
+    def _request_usb_apply(self) -> None:
+        assert self.usb_page is not None
+        if self.current_action and self.current_action.active:
+            self.usb_page.message = "USB changes are disabled while an action is active."
+            return
+        if self.state.vm[1] != "running":
+            self.usb_page.message = "Start Windows before applying live USB ownership changes."
+            return
+        changes = self.usb_page.changes(self.state.inventory)
+        if not changes:
+            self.usb_page.message = "No USB ownership changes are staged."
+            return
+        self.pending_usb = changes
+
+    def confirm_usb(self) -> None:
+        assignments = self.pending_usb
+        self.pending_usb = None
+        if not assignments:
+            return
+        if not self._authorize_sudo():
+            self.state.error = "sudo authorization was cancelled; no USB devices were changed"
+            return
+        arguments: list[str] = []
+        for usb_id, owner in assignments:
+            arguments.extend(("--windows" if owner == "Windows" else "--linux", usb_id))
+        try:
+            records = self.backend.start_worker("usb-route", arguments)
+            worker = records_by_kind(records).get("worker", [()])[0]
+            self.state.notice = f"Detached USB routing action started (PID {worker[1] if len(worker) > 1 else '?'})"
+            self.state.error = ""
+            self.state.log_scroll = 0
+            if self.usb_page:
+                self.usb_page.message = "USB routing is running; Activity Log contains detailed results."
+                self.usb_page.desired.clear()
+            if len(worker) > 1:
+                self.action_marker = (worker[0], "running", None)
+            self.refresh_action()
+            self.force_dynamic = self.force_static = True
+        except BackendError as exc:
+            if self.usb_page:
+                self.usb_page.message = str(exc)
+            else:
+                self.state.error = str(exc)
 
     def _handle_wizard(self, command: str) -> None:
         assert self.wizard is not None

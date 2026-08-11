@@ -7,7 +7,17 @@ import curses
 from typing import Iterable
 
 from .protocol import ActionInfo
-from .state import ACTIONS, COMPACT_TABS, DashboardState, MouseRegion, WizardState, WIZARD_STEPS, layout_mode
+from .state import (
+    COMPACT_TABS,
+    MENU_ITEMS,
+    DashboardState,
+    MouseRegion,
+    UsbPageState,
+    WizardState,
+    WIZARD_STEPS,
+    action_label,
+    layout_mode,
+)
 from .telemetry import safe_int, sparkline
 
 
@@ -91,14 +101,15 @@ class Renderer:
         return Rect(rect.y + 1, rect.x + 2, rect.h - 2, rect.w - 4)
 
     def render(self, state: DashboardState, action: ActionInfo | None, logs: list[str],
-               wizard: WizardState | None = None, modal: str = "", terminal_log: bool = False) -> None:
+               wizard: WizardState | None = None, usb_page: UsbPageState | None = None,
+               modal: str = "") -> None:
         self.screen.erase()
         self.regions = []
         height, width = self.screen.getmaxyx()
         if wizard is not None:
             self._wizard(state, wizard, height, width)
-        elif terminal_log:
-            self._terminal_log(action, logs, state.log_scroll, height, width)
+        elif usb_page is not None:
+            self._usb_page(state, usb_page, action, height, width)
         else:
             mode = layout_mode(width, height)
             self._header(state, action, width)
@@ -119,8 +130,7 @@ class Renderer:
         self.text(0, 1, "VM HELPER", 12, self.colors["title"])
         self.text(0, 15, state.mode, max(1, width - 40), mode_attr)
         if action:
-            label = next((spec.label for spec in ACTIONS if spec.worker_action == action.action), action.action)
-            worker = f"{label}: {action.status_text}"
+            worker = f"{action_label(action.action)}: {action.status_text}"
             worker_attr = self.colors["warn"] if action.active else (
                 self.colors["good"] if action.effective_status == "complete" else self.colors["bad"]
             )
@@ -131,10 +141,11 @@ class Renderer:
         self.text(1, 1, "-" * max(0, width - 2), width - 2, self.colors["dim"])
 
     def _footer(self, state: DashboardState, height: int, width: int) -> None:
-        help_text = "Up/Down move  Enter select  Tab panels  t terminal  r refresh  c config  q quit"
-        message = state.error or state.notice or help_text
+        help_text = "Up/Down menu  Enter select  Tab panels  PgUp/PgDn activity  r refresh  q quit"
+        message = state.error or state.notice or "Ready"
         attr = self.colors["bad"] if state.error else self.colors["warn"] if state.notice else self.colors["dim"]
-        self.text(height - 1, 1, message, width - 2, attr)
+        self.text(height - 2, 1, message, width - 2, attr)
+        self.text(height - 1, 1, help_text, width - 2, self.colors["dim"])
 
     def _small(self, height: int, width: int) -> None:
         lines = ("Terminal too small for the dashboard.", "Resize to at least 80 x 24.", "q or Esc still exits safely.")
@@ -143,20 +154,20 @@ class Renderer:
                       self.colors["warn"] if offset < 2 else self.colors["dim"])
 
     def _large(self, state: DashboardState, action: ActionInfo | None, logs: list[str], height: int, width: int) -> None:
-        top, body_h = 2, height - 3
+        top, body_h = 2, height - 4
         left_w = max(40, width // 3)
         right_w = width - left_w
         left_heights = (10, 11, body_h - 21)
         right_heights = (10, 11, body_h - 21)
-        self._actions(state, action, self.box(Rect(top, 0, left_heights[0], left_w), "Menu"))
+        self._menu(state, action, self.box(Rect(top, 0, left_heights[0], left_w), "Menu"))
         self._host(state, self.box(Rect(top + left_heights[0], 0, left_heights[1], left_w), "Host"))
         self._usb(state, self.box(Rect(top + sum(left_heights[:2]), 0, left_heights[2], left_w), "USB"))
         self._vm(state, self.box(Rect(top, left_w, right_heights[0], right_w), "Virtual Machine"))
         self._gpu_io(state, self.box(Rect(top + right_heights[0], left_w, right_heights[1], right_w), "GPU / I/O"))
-        self._logs(logs, state.log_scroll, self.box(Rect(top + sum(right_heights[:2]), left_w, right_heights[2], right_w), "Action Log"))
+        self._logs(logs, state.log_scroll, self.box(Rect(top + sum(right_heights[:2]), left_w, right_heights[2], right_w), "Activity Log"))
 
     def _compact(self, state: DashboardState, action: ActionInfo | None, logs: list[str], height: int, width: int) -> None:
-        self._action_bar(state, action, 2, width)
+        self._menu_bar(state, action, 2, width)
         x = 1
         for index, tab in enumerate(COMPACT_TABS):
             label = f" {tab} "
@@ -164,7 +175,7 @@ class Renderer:
             self.text(5, x, label, len(label), attr)
             self.regions.append(MouseRegion(5, x, 5, x + len(label) - 1, f"tab:{index}"))
             x += len(label) + 1
-        area = self.box(Rect(6, 0, height - 7, width), COMPACT_TABS[state.tab])
+        area = self.box(Rect(6, 0, height - 8, width), COMPACT_TABS[state.tab])
         tab = COMPACT_TABS[state.tab]
         if tab == "Overview":
             split = max(7, area.h // 2)
@@ -177,26 +188,26 @@ class Renderer:
         else:
             self._logs(logs, state.log_scroll, area)
 
-    def _action_bar(self, state: DashboardState, action: ActionInfo | None, y: int, width: int) -> None:
+    def _menu_bar(self, state: DashboardState, action: ActionInfo | None, y: int, width: int) -> None:
         x = 1
-        for index, spec in enumerate(ACTIONS):
+        for index, spec in enumerate(MENU_ITEMS):
             label = f" {index + 1}:{spec.label} "
-            disabled = bool(action and action.active)
-            attr = self.colors["dim"] if disabled else self.colors["select"] if index == state.selected_action else 0
+            disabled = bool(action and action.active and spec.kind != "quit")
+            attr = self.colors["dim"] if disabled else self.colors["select"] if index == state.selected_menu else 0
             if x + len(label) >= width:
                 y += 1; x = 1
             self.text(y, x, label, len(label), attr)
-            self.regions.append(MouseRegion(y, x, y, x + len(label) - 1, f"action:{index}"))
+            self.regions.append(MouseRegion(y, x, y, x + len(label) - 1, f"menu:{index}"))
             x += len(label) + 1
 
-    def _actions(self, state: DashboardState, action: ActionInfo | None, area: Rect) -> None:
-        for index, spec in enumerate(ACTIONS[:area.h]):
-            disabled = bool(action and action.active)
-            marker = ">" if index == state.selected_action else " "
+    def _menu(self, state: DashboardState, action: ActionInfo | None, area: Rect) -> None:
+        for index, spec in enumerate(MENU_ITEMS[:area.h]):
+            disabled = bool(action and action.active and spec.kind != "quit")
+            marker = ">" if index == state.selected_menu else " "
             label = f"{marker} {index + 1} [{spec.hotkey}] {spec.label}"
-            attr = self.colors["dim"] if disabled else self.colors["select"] if index == state.selected_action else 0
+            attr = self.colors["dim"] if disabled else self.colors["select"] if index == state.selected_menu else 0
             self.text(area.y + index, area.x, label, area.w, attr)
-            self.regions.append(MouseRegion(area.y + index, area.x, area.y + index, area.x + area.w - 1, f"action:{index}"))
+            self.regions.append(MouseRegion(area.y + index, area.x, area.y + index, area.x + area.w - 1, f"menu:{index}"))
 
     def _host(self, state: DashboardState, area: Rect) -> None:
         host = state.host; hist = state.histories
@@ -277,28 +288,42 @@ class Renderer:
         for index, line in enumerate(visible):
             self.text(area.y + index, area.x, line, area.w)
         if not visible:
-            self.text(area.y, area.x, "No action log yet", area.w, self.colors["dim"])
+            self.text(area.y, area.x, "No activity yet", area.w, self.colors["dim"])
         if scroll:
             self.text(area.y, max(area.x, area.x + area.w - 15), f"[{scroll} lines back]", 15, self.colors["warn"])
 
-    def _terminal_log(self, action: ActionInfo | None, logs: list[str], scroll: int,
-                      height: int, width: int) -> None:
-        self.text(0, 1, "VM HELPER ACTION TERMINAL", width - 2, self.colors["title"])
-        if action:
-            label = next((spec.label for spec in ACTIONS if spec.worker_action == action.action), action.action)
-            status_attr = self.colors["warn"] if action.active else (
-                self.colors["good"] if action.effective_status == "complete" else self.colors["bad"]
+    def _usb_page(self, state: DashboardState, page: UsbPageState, action: ActionInfo | None,
+                  height: int, width: int) -> None:
+        self.text(0, 1, "VM HELPER LIVE USB ROUTING", width - 2, self.colors["title"])
+        vm_running = len(state.vm) > 1 and state.vm[1] == "running"
+        summary = f"VM {state.vm[0]}: {'running' if vm_running else state.vm[1]}"
+        self.text(0, max(1, width - len(summary) - 2), summary, width - 2,
+                  self.colors["good"] if vm_running else self.colors["warn"])
+        area = self.box(Rect(2, 0, height - 5, width), "USB Devices")
+        self.text(area.y, area.x, "    Default  ID         Current   Desired   Device", area.w, self.colors["dim"])
+        routes = state.inventory.usb_routes
+        visible_height = max(0, area.h - 1)
+        start = max(0, min(page.cursor - visible_height + 1, len(routes) - visible_height)) if visible_height else 0
+        for index, route in enumerate(routes[start:start + visible_height], start):
+            marker = ">" if index == page.cursor else " "
+            default = "*" if route.configured else " "
+            target = page.target(route)
+            current = route.owner if route.present else "Missing"
+            suffix = f"  [{route.unavailable_reason}]" if route.unavailable_reason else ""
+            row = f"{marker}     {default}    {route.usb_id:9}  {current:8}  {target:8}  {route.label}{suffix}"
+            attr = self.colors["select"] if index == page.cursor else (
+                self.colors["bad"] if route.unavailable_reason else self.colors["warn"] if target != current else 0
             )
-            status = f"{label}: {action.status_text}"
-            self.text(0, max(1, width - len(status) - 2), status, width - 2, status_attr)
-            command = f"$ vm-helper {action.action}    # detached PID {action.pid}"
-        else:
-            command = "$ waiting for an action"
-        self.text(2, 1, command, width - 2, self.colors["dim"])
-        self.text(3, 1, "-" * max(0, width - 2), width - 2, self.colors["dim"])
-        self._logs(logs, scroll, Rect(4, 1, max(0, height - 6), max(0, width - 2)))
-        footer = "Up/Down/PgUp/PgDn scroll  t/Esc dashboard  q quit (worker continues)"
-        self.text(height - 1, 1, footer, width - 2, self.colors["dim"])
+            self.text(area.y + index - start + 1, area.x, row, area.w, attr)
+        if not routes:
+            self.text(area.y + 1, area.x, "No connected USB devices or configured defaults were found.", area.w, self.colors["dim"])
+        changes = len(page.changes(state.inventory))
+        worker_note = "  Routing action is active" if action and action.active else ""
+        message = page.message or state.error or state.notice or f"{changes} staged change(s){worker_note}"
+        attr = self.colors["bad"] if page.message or state.error else self.colors["warn"] if changes or state.notice else self.colors["dim"]
+        self.text(height - 2, 1, message, width - 2, attr)
+        self.text(height - 1, 1, "Up/Down select  Left Linux  Right Windows  Space toggle  Enter/a apply  r refresh  q/Esc back",
+                  width - 2, self.colors["dim"])
 
     def _wizard(self, state: DashboardState, wizard: WizardState, height: int, width: int) -> None:
         self.text(0, 1, "VM HELPER CONFIGURATION", width - 2, self.colors["title"])
@@ -307,7 +332,7 @@ class Renderer:
             marker = ">" if index == wizard.step else " "
             attr = self.colors["select"] if index == wizard.step else self.colors["dim"]
             self.text(2 + index, 1, f"{marker} {index + 1}. {step}", side - 2, attr)
-        area = self.box(Rect(1, side, height - 3, width - side), WIZARD_STEPS[wizard.step])
+        area = self.box(Rect(1, side, height - 4, width - side), WIZARD_STEPS[wizard.step])
         inv = state.inventory
         if wizard.step == 0:
             self._choices(area, [f"{name}  ({status})" for name, status in inv.domains], wizard.cursor)
@@ -339,8 +364,10 @@ class Renderer:
             for index, row in enumerate(rows[:area.h]):
                 attr = self.colors["bad"] if row.startswith("WARNING") else self.colors["warn"] if "Press Enter" in row else 0
                 self.text(area.y + index, area.x, row, area.w, attr)
-        footer = wizard.message or "Up/Down select  Space toggle USB  Enter next  Left/Esc back  q cancel"
-        self.text(height - 1, 1, footer, width - 2, self.colors["bad"] if wizard.message else self.colors["dim"])
+        self.text(height - 2, 1, wizard.message or state.error or state.notice or "Configuration defaults",
+                  width - 2, self.colors["bad"] if wizard.message or state.error else self.colors["warn"] if state.notice else self.colors["dim"])
+        self.text(height - 1, 1, "Up/Down select  Space toggle USB  Enter next  Left/Esc back  q cancel",
+                  width - 2, self.colors["dim"])
 
     def _choices(self, area: Rect, rows: Iterable[str], selected: int) -> None:
         for index, row in enumerate(list(rows)[:area.h]):

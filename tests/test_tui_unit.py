@@ -12,8 +12,10 @@ from vm_helper_tui.protocol import ActionInfo, ActionStore, Backend, ProtocolErr
 from vm_helper_tui.state import (
     DEFAULT_LAYOUT_PROFILE,
     Inventory,
+    MENU_ITEMS,
     MouseRegion,
     PANEL_REGISTRY,
+    UsbPageState,
     WizardState,
     layout_mode,
     map_key,
@@ -87,16 +89,43 @@ class LayoutAndInputTests(unittest.TestCase):
         registered = {panel.key for panel in PANEL_REGISTRY}
         profiled = {key for column in DEFAULT_LAYOUT_PROFILE["large_columns"] for key in column}
         self.assertEqual(profiled, registered)
-        self.assertEqual(next(panel.title for panel in PANEL_REGISTRY if panel.key == "actions"), "Menu")
+        self.assertEqual(next(panel.title for panel in PANEL_REGISTRY if panel.key == "menu"), "Menu")
+        self.assertEqual(next(panel.title for panel in PANEL_REGISTRY if panel.key == "logs"), "Activity Log")
+        self.assertEqual(
+            [item.label for item in MENU_ITEMS],
+            ["Linux", "Windows", "Linux + Windows", "Validate", "USB", "Configure", "Quit"],
+        )
 
     def test_key_and_mouse_mapping(self) -> None:
         self.assertEqual(map_key(curses.KEY_DOWN), "down")
-        self.assertEqual(map_key(ord("1")), "action:0")
-        self.assertEqual(map_key(ord("t")), "terminal_log")
+        self.assertEqual(map_key(ord("1")), "menu:0")
+        self.assertEqual(map_key(ord("5")), "menu:4")
+        self.assertEqual(map_key(ord("c")), "menu:5")
+        self.assertIsNone(map_key(ord("t")))
         self.assertEqual(map_key(27), "escape")
-        region = MouseRegion(2, 3, 4, 8, "action:2")
-        self.assertEqual(map_mouse(3, 5, curses.BUTTON1_CLICKED, [region]), "action:2")
+        region = MouseRegion(2, 3, 4, 8, "menu:2")
+        self.assertEqual(map_mouse(3, 5, curses.BUTTON1_CLICKED, [region]), "menu:2")
         self.assertIsNone(map_mouse(8, 8, curses.BUTTON1_CLICKED, [region]))
+
+    def test_usb_page_stages_only_eligible_live_changes(self) -> None:
+        inv = Inventory()
+        inv.update(parse_records(payload(
+            ("usb_route", ("Keyboard", "1234", "abcd", "yes", "yes", "Linux", 1)),
+            ("usb_route", ("Duplicate", "2222", "0001", "yes", "no", "Linux", 2)),
+            ("usb_route", ("Missing", "9999", "0001", "no", "yes", "Missing", 0)),
+        )))
+        page = UsbPageState()
+        page.sync(inv)
+        self.assertFalse(page.set_target("Windows", inv, vm_running=False))
+        self.assertIn("Start Windows", page.message)
+        self.assertTrue(page.set_target("Windows", inv, vm_running=True))
+        self.assertEqual(page.changes(inv), [("1234:abcd", "Windows")])
+        page.move(1, inv)
+        self.assertFalse(page.set_target("Windows", inv, vm_running=True))
+        self.assertIn("identical", page.message)
+        page.move(1, inv)
+        self.assertFalse(page.set_target("Linux", inv, vm_running=True))
+        self.assertIn("missing", page.message)
 
 
 class WizardTests(unittest.TestCase):
