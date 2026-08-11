@@ -112,7 +112,7 @@ The wizard selects a libvirt domain, reviews a GPU with its companion functions/
 ## Safety
 
 - Run GPU transitions from TTY or SSH. Graphical-session execution is rejected unless `ALLOW_GUI=1`.
-- Mutating GPU modes acquire and keep a reusable sudo timestamp before changing devices. Later privileged calls are non-interactive, so USB keyboard handoff cannot strand a password prompt; authorization failure stops before device ownership changes.
+- Mutating TUI modes acquire sudo on the originating TTY, then a user-owned supervisor invokes `sudo -n` before `setsid` starts the detached privileged worker. The worker therefore needs no later password prompt after USB/terminal handoff. An expired ticket rejects the launch before device ownership changes and selecting the action again reopens authorization.
 - Every raw VM disk must exist, remain unmounted on Linux, and not report `offline`. A configured `WIN_DISK` must resolve to one of those attached disks.
 - Every selected GPU function must already exist in the VM's persistent PCI hostdev configuration.
 - Missing configured USB devices stop VM startup before display-manager shutdown.
@@ -120,11 +120,11 @@ The wizard selects a libvirt domain, reviews a GPU with its companion functions/
 - NVIDIA module unload failure is a hard stop before libvirt can partially detach a busy GPU.
 - Graceful guest shutdown is the default. The tool never calls `virsh destroy`.
 - GPU transitions, USB mutations, and configuration writes share a non-blocking `flock`; CLI, classic-menu, and TUI operations cannot overlap.
-- The TUI briefly suspends curses for `sudo -v`, then starts a detached Bash worker. Closing the TUI, terminal, or SSH session does not cancel a transition, and there is deliberately no unsafe process-cancel action.
+- The TUI briefly suspends curses for `sudo -v`, then starts the user-owned supervisor described above. Closing the TUI, terminal, or SSH session does not cancel its detached privileged worker, and there is deliberately no unsafe process-cancel action.
 
 ## Runtime Files
 
-Detached actions store one mode-`0600` `.log` and `.meta` pair per action under `$XDG_RUNTIME_DIR/vm-helper/`. The metadata uses the same versioned NUL-delimited record protocol as dashboard snapshots, so labels and paths are never reconstructed by splitting display text. A later TUI launch finds a running or most recent action, reconnects to its log, and shows its final outcome even after the worker PID exits.
+Detached actions store one mode-`0600` `.log` and `.meta` pair per action under `$XDG_RUNTIME_DIR/vm-helper/`. The unprivileged supervisor owns and atomically updates those files even when the transition itself runs as root. The metadata uses the same versioned NUL-delimited record protocol as dashboard snapshots, so labels and paths are never reconstructed by splitting display text. A later TUI launch finds a running or most recent action, reconnects to its log, and shows its final outcome even after the worker PID exits.
 
 When `$XDG_RUNTIME_DIR` is unavailable, the helper uses `/run/user/$UID` when present, then a private directory below the system temporary directory. The runtime directory and mutation lock are mode `0700`/`0600`. Runtime records are transient and must not be committed.
 
@@ -158,7 +158,7 @@ git diff --check
 
 The read-only commands are safe to run from a desktop. GPU and USB ownership commands intentionally mutate machine state and may require sudo. USB attach/detach errors are reported instead of being treated as an assumed already-attached state.
 
-If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw console, commonly `xterm-256color` elsewhere), then use `reset` or the classic menu. `TERM=dumb` intentionally bypasses curses. If a TUI disappears during a transition, relaunch it to reconnect; do not start an opposing direct command while the action lock is active. Press `t` to reopen the most recent Action Terminal. If Validate reports `FAILED`, its output describes a completed read-only check with a failed safety condition, not a transition that is still running.
+If the screen is garbled, confirm `TERM` matches the client (`linux` on a raw console, commonly `xterm-256color` elsewhere), then use `reset` or the classic menu. `TERM=dumb` intentionally bypasses curses. If a TUI disappears during a transition, relaunch it to reconnect; do not start an opposing direct command while the action lock is active. Press `t` to reopen the most recent Action Terminal. If launch reports that sudo authorization expired, return to the Menu and select the action again to get a fresh prompt. If Validate reports `FAILED`, its output describes a completed read-only check with a failed safety condition, not a transition that is still running.
 
 ## Handoff
 

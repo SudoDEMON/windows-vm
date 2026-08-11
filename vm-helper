@@ -35,6 +35,8 @@ VM_XML=""
 TEMP_FILES=()
 VM_RAW_DISKS=()
 SUDO_KEEPALIVE_PID=""
+WORKER_RUNTIME_DIR=""
+WORKER_OWNER_UID=""
 
 cleanup() {
   if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
@@ -54,17 +56,26 @@ read_file() { [[ -r "$1" ]] && cat -- "$1" || true; }
 
 runtime_dir() {
   local base="${XDG_RUNTIME_DIR:-}"
+  if [[ -n "$WORKER_RUNTIME_DIR" ]]; then printf '%s' "$WORKER_RUNTIME_DIR"; return; fi
   if [[ -z "$base" && -d "/run/user/$UID" ]]; then base="/run/user/$UID"; fi
   if [[ -z "$base" ]]; then base="${TMPDIR:-/tmp}/vm-helper-$UID"; fi
   printf '%s/vm-helper' "$base"
 }
 
 ensure_runtime_dir() {
-  local dir
+  local dir expected_uid actual_uid mode
   dir="$(runtime_dir)"
-  mkdir -p -- "$dir"
-  chmod 700 -- "$dir"
-  [[ -d "$dir" && -O "$dir" ]] || die "runtime directory is not owned by the current user: $dir"
+  expected_uid="${WORKER_OWNER_UID:-$UID}"
+  if [[ -n "$WORKER_RUNTIME_DIR" ]]; then
+    [[ -d "$dir" && ! -L "$dir" ]] || die "worker runtime directory is invalid: $dir"
+  else
+    mkdir -p -- "$dir"
+    chmod 700 -- "$dir"
+  fi
+  actual_uid="$(stat -c %u -- "$dir" 2>/dev/null || true)"
+  mode="$(stat -c %a -- "$dir" 2>/dev/null || true)"
+  [[ "$actual_uid" == "$expected_uid" ]] || die "runtime directory has unexpected owner: $dir"
+  [[ "$mode" == 700 ]] || die "runtime directory must have mode 0700: $dir"
   printf '%s' "$dir"
 }
 
@@ -1040,24 +1051,13 @@ write_worker_metadata() {
   mv -f -- "$tmp" "$path"
 }
 
-worker_finish() {
-  local rc="$1" status=failed
-  ((rc == 0)) && status=complete
-  cleanup
-  write_worker_metadata "$WORKER_META" "$WORKER_TOKEN" "$$" "$WORKER_ACTION" "$status" \
-    "$WORKER_STARTED" "$(date +%s)" "$rc" "$WORKER_LOG"
-}
-
 worker_run() {
-  local token="$1" action="$2" dir
+  local token="$1" action="$2" dir="$3" owner_uid="$4"
   [[ "$token" =~ ^[0-9A-Za-z._-]+$ ]] || die "invalid worker token"
   case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|check) ;; *) die "invalid worker action: $action" ;; esac
-  dir="$(ensure_runtime_dir)"
-  WORKER_TOKEN="$token"; WORKER_ACTION="$action"; WORKER_STARTED="$(date +%s)"
-  WORKER_LOG="$dir/action-$token.log"; WORKER_META="$dir/action-$token.meta"
-  write_worker_metadata "$WORKER_META" "$WORKER_TOKEN" "$$" "$WORKER_ACTION" running \
-    "$WORKER_STARTED" '' '' "$WORKER_LOG"
-  trap 'worker_finish $?' EXIT
+  [[ "$dir" == /* && "$owner_uid" =~ ^[0-9]+$ ]] || die "invalid worker runtime identity"
+  WORKER_RUNTIME_DIR="$dir"; WORKER_OWNER_UID="$owner_uid"
+  ensure_runtime_dir >/dev/null
   case "$action" in
     linux) return_linux_mode ;;
     windows) start_windows_mode ;;
@@ -1068,16 +1068,58 @@ worker_run() {
   esac
 }
 
+worker_supervise() {
+  local token="$1" action="$2" dir="$3" owner_uid="$4" started="$5"
+  local start_path log_path meta_path deadline rc=1 status=failed
+  [[ "$token" =~ ^[0-9A-Za-z._-]+$ ]] || die "invalid worker token"
+  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|check) ;; *) die "invalid worker action: $action" ;; esac
+  [[ "$dir" == /* && "$owner_uid" =~ ^[0-9]+$ && "$owner_uid" == "$UID" && "$started" =~ ^[0-9]+$ ]] \
+    || die "invalid worker supervisor identity"
+  WORKER_RUNTIME_DIR="$dir"; WORKER_OWNER_UID="$owner_uid"
+  ensure_runtime_dir >/dev/null
+  start_path="$dir/action-$token.start"; log_path="$dir/action-$token.log"; meta_path="$dir/action-$token.meta"
+  deadline=$((SECONDS + 5))
+  while [[ ! -e "$start_path" ]]; do
+    ((SECONDS < deadline)) || die "worker launch handshake timed out"
+    command sleep 0.02
+  done
+  rm -f -- "$start_path"
+  if [[ "$action" == check ]]; then
+    log "starting detached read-only worker"
+    if setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid"; then rc=0; else rc=$?; fi
+  elif ((EUID == 0)); then
+    log "starting detached privileged worker"
+    if setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid"; then rc=0; else rc=$?; fi
+  else
+    log "sudo authorized on launcher TTY; starting detached privileged worker"
+    if sudo -n setsid "$SCRIPT_PATH" __worker-run "$token" "$action" "$dir" "$owner_uid"; then rc=0; else rc=$?; fi
+  fi
+  ((rc == 0)) && status=complete
+  write_worker_metadata "$meta_path" "$token" "$$" "$action" "$status" \
+    "$started" "$(date +%s)" "$rc" "$log_path"
+  return "$rc"
+}
+
 worker_start() {
-  local action="$1" dir token log_path meta_path pid
+  local action="$1" dir token log_path meta_path start_path lock_path pid owner_uid started
   case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|check) ;; *) die "invalid worker action: $action" ;; esac
   need nohup; need setsid
+  if [[ "$action" != check && EUID -ne 0 ]]; then
+    need sudo
+    sudo -n true 2>/dev/null \
+      || die "sudo authorization expired before worker launch; select the action again to authorize"
+  fi
   dir="$(ensure_runtime_dir)"; token="$(date +%Y%m%d%H%M%S)-$$-$RANDOM"
+  owner_uid="$UID"; started="$(date +%s)"
   log_path="$dir/action-$token.log"; meta_path="$dir/action-$token.meta"
+  start_path="$dir/action-$token.start"; lock_path="$dir/mutation.lock"
   umask 077; : >"$log_path"; chmod 600 -- "$log_path"
-  nohup setsid "$SCRIPT_PATH" __worker-run "$token" "$action" </dev/null >>"$log_path" 2>&1 &
+  if [[ "$action" != check ]]; then : >>"$lock_path"; chmod 600 -- "$lock_path"; fi
+  nohup "$SCRIPT_PATH" __worker-supervise "$token" "$action" "$dir" "$owner_uid" "$started" \
+    </dev/null >>"$log_path" 2>&1 &
   pid=$!
-  write_worker_metadata "$meta_path" "$token" "$pid" "$action" running "$(date +%s)" '' '' "$log_path"
+  write_worker_metadata "$meta_path" "$token" "$pid" "$action" running "$started" '' '' "$log_path"
+  : >"$start_path"; chmod 600 -- "$start_path"
   protocol_begin
   protocol_record worker "$token" "$pid" "$action" "$log_path" "$meta_path"
 }
@@ -1266,7 +1308,16 @@ dispatch() {
         *) die "unknown machine endpoint: ${2:-}" ;;
       esac
       ;;
-    __worker-run) [[ -n "${2:-}" && -n "${3:-}" ]] || die 'invalid worker invocation'; worker_run "$2" "$3" ;;
+    __worker-supervise)
+      [[ -n "${2:-}" && -n "${3:-}" && -n "${4:-}" && -n "${5:-}" && -n "${6:-}" ]] \
+        || die 'invalid worker supervisor invocation'
+      worker_supervise "$2" "$3" "$4" "$5" "$6"
+      ;;
+    __worker-run)
+      [[ -n "${2:-}" && -n "${3:-}" && -n "${4:-}" && -n "${5:-}" ]] \
+        || die 'invalid worker invocation'
+      worker_run "$2" "$3" "$4" "$5"
+      ;;
     help|-h|--help) usage ;;
     *) usage >&2; die "unknown command: $command" ;;
   esac

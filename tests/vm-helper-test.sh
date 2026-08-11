@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VM_MANAGER_CONFIG=/nonexistent source "$ROOT/vm-helper"
+test_tmp="$(mktemp -d)"
+export XDG_RUNTIME_DIR="$test_tmp/runtime"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -108,7 +110,6 @@ start_coexist_mode >/dev/null
 assert_equal "$begin_root_session_calls" 1
 assert_equal "$display_manager_active" 1
 
-test_tmp="$(mktemp -d)"
 protocol_file="$test_tmp/protocol.bin"
 {
   protocol_begin
@@ -131,7 +132,6 @@ fi
 status_report() { printf '%s' direct-status-dispatch; }
 assert_equal "$(dispatch status)" direct-status-dispatch
 
-export XDG_RUNTIME_DIR="$test_tmp/runtime"
 ready_file="$test_tmp/lock-ready"
 (with_mutation_lock bash -c ': >"$1"; sleep 1' _ "$ready_file") &
 lock_holder_pid=$!
@@ -147,6 +147,59 @@ if (write_config >/dev/null 2>&1); then
   fail 'configuration write ignored an active mutation lock'
 fi
 wait "$lock_holder_pid"
+
+original_script_path="$SCRIPT_PATH"
+supervisor_dir="$(ensure_runtime_dir)"
+success_token=supervisor-success
+success_log="$supervisor_dir/action-$success_token.log"
+: >"$success_log"
+: >"$supervisor_dir/action-$success_token.start"
+SCRIPT_PATH=/usr/bin/true
+SUDO_CALLS=()
+worker_supervise "$success_token" linux-windows "$supervisor_dir" "$UID" 100 >/dev/null
+assert_equal "${SUDO_CALLS[0]}" "-n setsid /usr/bin/true __worker-run $success_token linux-windows $supervisor_dir $UID"
+
+failure_token=supervisor-failure
+failure_log="$supervisor_dir/action-$failure_token.log"
+: >"$failure_log"
+: >"$supervisor_dir/action-$failure_token.start"
+SCRIPT_PATH=/usr/bin/false
+SUDO_CALLS=()
+if worker_supervise "$failure_token" linux-windows "$supervisor_dir" "$UID" 200 >/dev/null 2>&1; then
+  fail 'worker supervisor hid a privileged worker failure'
+fi
+assert_equal "${SUDO_CALLS[0]}" "-n setsid /usr/bin/false __worker-run $failure_token linux-windows $supervisor_dir $UID"
+
+SCRIPT_PATH=/usr/bin/true
+SUDO_CALLS=()
+worker_start linux-windows >"$test_tmp/worker-start.bin"
+assert_equal "${SUDO_CALLS[0]}" '-n true'
+SUDO_CALLS=()
+worker_start check >"$test_tmp/check-start.bin"
+assert_equal "${#SUDO_CALLS[@]}" 0
+
+PYTHONPATH="$ROOT" python3 - "$supervisor_dir" "$test_tmp/worker-start.bin" "$test_tmp/check-start.bin" <<'PY'
+import os
+from pathlib import Path
+import sys
+from vm_helper_tui.protocol import parse_records
+
+directory = Path(sys.argv[1])
+success = parse_records((directory / "action-supervisor-success.meta").read_bytes())[0].fields
+failure = parse_records((directory / "action-supervisor-failure.meta").read_bytes())[0].fields
+assert success[3] == "complete" and success[4] == "100" and success[6] == "0"
+assert failure[3] == "failed" and failure[4] == "200" and failure[6] == "1"
+for path in (directory / "action-supervisor-success.meta", directory / "action-supervisor-failure.meta"):
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_uid == os.getuid()
+for payload, action in ((Path(sys.argv[2]).read_bytes(), "linux-windows"),
+                        (Path(sys.argv[3]).read_bytes(), "check")):
+    worker = parse_records(payload)[0]
+    assert worker.kind == "worker" and worker.fields[2] == action
+PY
+SCRIPT_PATH="$original_script_path"
+WORKER_RUNTIME_DIR=""
+WORKER_OWNER_UID=""
 
 start_windows_mode() { printf windows; }
 start_coexist_mode() { printf coexist; }

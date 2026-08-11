@@ -47,7 +47,7 @@ The panel registry and default profile intentionally make layout order/visibilit
 - Every attached raw block disk must be online and completely unmounted on Linux.
 - Configured USB devices must be connected before VM startup.
 - The display manager is stopped before handing the GPU to the VM.
-- Sudo authorization is acquired and kept alive before device transitions; post-handoff privileged calls never prompt for input.
+- TUI sudo authorization is acquired on the originating TTY. A user-owned, SIGHUP-resistant supervisor must invoke `sudo -n` before `setsid`; the resulting detached worker runs privileged and never prompts after the terminal or USB keyboard is gone. Never reverse that ordering.
 - Active GPU users and busy NVIDIA modules stop the transition.
 - Post-start verification requires every selected PCI function on `vfio-pci`.
 - Return-to-Linux skips libvirt reattach for devices already on a host driver. This prevents the fresh-boot reattach bug that can leave NVIDIA half-detached.
@@ -55,7 +55,7 @@ The panel registry and default profile intentionally make layout order/visibilit
 - The display manager starts only after the returned GPU has a host driver and vendor health checks pass.
 - Guest shutdown remains graceful; no helper uses `virsh destroy`.
 - All GPU, USB, and configuration mutations enter the same `flock`, including nested coexist/USB paths.
-- TUI workers are detached session leaders. Per-action binary metadata and text logs live below `$XDG_RUNTIME_DIR/vm-helper/` with mode `0600`; closing curses must never signal or cancel them.
+- TUI privileged workers are detached session leaders watched by unprivileged supervisors. Supervisors atomically maintain user-owned binary metadata and text logs below `$XDG_RUNTIME_DIR/vm-helper/` with mode `0600`; closing curses must never signal or cancel them.
 
 ## Vendor Behavior
 
@@ -86,7 +86,7 @@ Dynamic snapshots and static inventory run as separate pollable subprocess group
 
 ## Validation Additions
 
-`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, shared mutation locking, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, the live Action Terminal, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
+`tests/vm-helper-test.sh` covers binary protocol framing, internal argument validation, shared mutation locking, sudo-before-`setsid` worker supervision, user-owned completion metadata, and direct-command dispatch. `tests/test_tui_unit.py` covers parsing, deltas, sparklines, modes, layouts, input/mouse mapping, wizard state, non-blocking calls, outcome labels, and detached-log reconnection. `tests/test_tui_pty.py` exercises `TERM=linux` at 80x24, `xterm-256color` at 140x40, resize/redraw/navigation, the live Action Terminal, slow-telemetry input responsiveness, classic fallback, clean exit, and terminal restoration. `tests/fake-vm-helper` never touches real devices.
 
 ## Repository Hygiene
 
