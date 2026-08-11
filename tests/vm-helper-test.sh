@@ -108,4 +108,61 @@ start_coexist_mode >/dev/null
 assert_equal "$begin_root_session_calls" 1
 assert_equal "$display_manager_active" 1
 
+test_tmp="$(mktemp -d)"
+protocol_file="$test_tmp/protocol.bin"
+{
+  protocol_begin
+  protocol_record sample 'label | with spaces' '/dev/a path' $'line one\nline two'
+} >"$protocol_file"
+PYTHONPATH="$ROOT" python3 - "$protocol_file" <<'PY'
+import pathlib
+import sys
+from vm_helper_tui.protocol import parse_records
+
+records = parse_records(pathlib.Path(sys.argv[1]).read_bytes())
+assert records[0].kind == "sample"
+assert records[0].fields == ("label | with spaces", "/dev/a path", "line one\nline two")
+PY
+
+if (internal_configure --vm fake --gpu invalid >/dev/null 2>&1); then
+  fail 'internal configuration accepted an invalid GPU BDF'
+fi
+
+status_report() { printf '%s' direct-status-dispatch; }
+assert_equal "$(dispatch status)" direct-status-dispatch
+
+export XDG_RUNTIME_DIR="$test_tmp/runtime"
+ready_file="$test_tmp/lock-ready"
+(with_mutation_lock bash -c ': >"$1"; sleep 1' _ "$ready_file") &
+lock_holder_pid=$!
+while [[ ! -e "$ready_file" ]]; do command sleep 0.02; done
+if (start_windows_mode >/dev/null 2>&1); then
+  fail 'GPU transition ignored an active mutation lock'
+fi
+if (usb_action attach >/dev/null 2>&1); then
+  fail 'USB mutation ignored an active mutation lock'
+fi
+_write_config() { return 0; }
+if (write_config >/dev/null 2>&1); then
+  fail 'configuration write ignored an active mutation lock'
+fi
+wait "$lock_holder_pid"
+
+start_windows_mode() { printf windows; }
+start_coexist_mode() { printf coexist; }
+return_linux_mode() { printf linux; }
+preflight_report() { printf check; }
+hardware_report() { printf hardware; }
+configure_interactive() { printf configure; }
+usb_action() { printf 'usb:%s' "$1"; }
+tui_available() { return 1; }
+assert_equal "$(dispatch windows)" windows
+assert_equal "$(dispatch linux-windows)" coexist
+assert_equal "$(dispatch linux)" linux
+assert_equal "$(dispatch check)" check
+assert_equal "$(dispatch hardware)" hardware
+assert_equal "$(dispatch configure 2>/dev/null)" configure
+assert_equal "$(dispatch usb status)" usb:status
+rm -rf -- "$test_tmp"
+
 printf '%s\n' 'vm-helper regression tests passed'
