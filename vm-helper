@@ -20,6 +20,9 @@ SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-300}"
 REATTACH_TIMEOUT="${REATTACH_TIMEOUT:-20}"
 NVIDIA_SMI_TIMEOUT="${NVIDIA_SMI_TIMEOUT:-10}"
 USB_AUTO_DISCOVER="${USB_AUTO_DISCOVER:-1}"
+MACHINE_PROTOCOL_VERSION=1
+MUTATION_LOCK_DEPTH=0
+MUTATION_LOCK_FD=""
 
 if ! declare -p GPU_PCI >/dev/null 2>&1; then declare -a GPU_PCI=(); fi
 if ! declare -p GPU_MODULES >/dev/null 2>&1; then declare -a GPU_MODULES=(); fi
@@ -48,6 +51,49 @@ warn() { printf '[vm-helper] WARNING: %s\n' "$*" >&2; }
 die() { printf '[vm-helper] ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 read_file() { [[ -r "$1" ]] && cat -- "$1" || true; }
+
+runtime_dir() {
+  local base="${XDG_RUNTIME_DIR:-}"
+  if [[ -z "$base" && -d "/run/user/$UID" ]]; then base="/run/user/$UID"; fi
+  if [[ -z "$base" ]]; then base="${TMPDIR:-/tmp}/vm-helper-$UID"; fi
+  printf '%s/vm-helper' "$base"
+}
+
+ensure_runtime_dir() {
+  local dir
+  dir="$(runtime_dir)"
+  mkdir -p -- "$dir"
+  chmod 700 -- "$dir"
+  [[ -d "$dir" && -O "$dir" ]] || die "runtime directory is not owned by the current user: $dir"
+  printf '%s' "$dir"
+}
+
+protocol_begin() { printf 'VMH%s\0' "$MACHINE_PROTOCOL_VERSION"; }
+
+protocol_record() {
+  local kind="$1"; shift
+  printf '%s\0%d\0' "$kind" "$#"
+  (($# == 0)) || printf '%s\0' "$@"
+}
+
+with_mutation_lock() {
+  local dir lock_file rc=0
+  if ((MUTATION_LOCK_DEPTH > 0)); then "$@"; return; fi
+  need flock
+  dir="$(ensure_runtime_dir)"; lock_file="$dir/mutation.lock"
+  exec {MUTATION_LOCK_FD}>"$lock_file"
+  chmod 600 -- "$lock_file"
+  if ! flock -n "$MUTATION_LOCK_FD"; then
+    exec {MUTATION_LOCK_FD}>&-
+    die "another VM/GPU/USB/configuration mutation is already active"
+  fi
+  MUTATION_LOCK_DEPTH=1
+  if "$@"; then rc=0; else rc=$?; fi
+  MUTATION_LOCK_DEPTH=0
+  flock -u "$MUTATION_LOCK_FD" || true
+  exec {MUTATION_LOCK_FD}>&-
+  return "$rc"
+}
 
 as_root() {
   if ((EUID == 0)); then "$@"; else sudo -n "$@"; fi
@@ -438,7 +484,7 @@ wait_for_vfio() {
   return 1
 }
 
-start_windows_mode() {
+_start_windows_mode() {
   local state users pci
   load_runtime_config
   state="$(required_domstate)"
@@ -474,7 +520,7 @@ start_windows_mode() {
   log "$VM is running with the selected GPU"
 }
 
-start_coexist_mode() {
+_start_coexist_mode() {
   local state pci started=0
   load_runtime_config
   state="$(required_domstate)"
@@ -510,7 +556,7 @@ reattach_if_needed() {
   esac
 }
 
-return_linux_mode() {
+_return_linux_mode() {
   local state pci driver primary_driver
   load_runtime_config
   state="$(required_domstate)"
@@ -559,7 +605,7 @@ usb_live_count() {
     - 2>/dev/null <<<"$live_xml" || printf '0'
 }
 
-usb_action() {
+_usb_action() {
   local action="$1" state item label vid pid file count output
   [[ "$action" =~ ^(status|xml|attach|detach)$ ]] || die "unknown USB action: $action"
   load_runtime_config
@@ -612,6 +658,16 @@ usb_action() {
   done
   udevadm settle --timeout=5 >/dev/null 2>&1 || true
   [[ "$action" == "attach" ]] && virsh -c "$URI" qemu-monitor-command "$VM" --hmp 'info usb' 2>/dev/null || true
+}
+
+start_windows_mode() { with_mutation_lock _start_windows_mode; }
+start_coexist_mode() { with_mutation_lock _start_coexist_mode; }
+return_linux_mode() { with_mutation_lock _return_linux_mode; }
+usb_action() {
+  case "$1" in
+    attach|detach) with_mutation_lock _usb_action "$@" ;;
+    *) _usb_action "$@" ;;
+  esac
 }
 
 hardware_report() {
@@ -668,6 +724,212 @@ preflight_report() {
   log "preflight passed for $VM"
 }
 
+trim_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+machine_disk_record() {
+  local disk="$1" exists=no resolved='' state='' mounted=''
+  if [[ -e "$disk" ]]; then
+    exists=yes
+    resolved="$(readlink -f -- "$disk" 2>/dev/null || true)"
+    if [[ -b "$resolved" ]]; then
+      state="$(lsblk -dnro STATE "$resolved" 2>/dev/null | awk 'NF {print; exit}')"
+      mounted="$(lsblk -nrpo NAME,MOUNTPOINT "$resolved" 2>/dev/null | awk '$2 != "" {print}')"
+    fi
+  fi
+  protocol_record disk "$disk" "$resolved" "$exists" "${state:-unknown}" "$mounted"
+}
+
+machine_snapshot() {
+  local state display pci item label vid pid present attached count index name path
+  local temp util memory_used memory_total power vcpus dominfo
+  local -A stats=()
+  load_runtime_config >/dev/null
+  state="$(required_domstate)"
+  while IFS='=' read -r name path; do
+    [[ -n "$name" ]] && stats["$name"]="$path"
+  done < <(virsh -c "$URI" domstats "$VM" --state --cpu-total --vcpu --balloon --interface --block --raw 2>/dev/null || true)
+  vcpus="${stats[vcpu.current]:-0}"
+  if [[ ! "$vcpus" =~ ^[1-9][0-9]*$ ]]; then
+    vcpus="$(virsh -c "$URI" vcpucount "$VM" --config --maximum 2>/dev/null | awk 'NF {print $1; exit}')"
+  fi
+  memory_used="${stats[balloon.current]:-0}"; memory_total="${stats[balloon.maximum]:-0}"
+  if [[ "$memory_total" == 0 ]]; then
+    dominfo="$(LC_ALL=C virsh -c "$URI" dominfo "$VM" 2>/dev/null || true)"
+    memory_total="$(awk -F: '/^Max memory:/ {gsub(/^[ \t]+/, "", $2); print $2+0; exit}' <<<"$dominfo")"
+    [[ "$state" == 'shut off' ]] && memory_used="$memory_total"
+  fi
+
+  display="$(systemctl is-active display-manager.service 2>/dev/null || true)"
+  protocol_begin
+  protocol_record snapshot "$(date +%s)"
+  protocol_record vm "$VM" "$state" "$URI" "${vcpus:-0}" \
+    "${stats[cpu.time]:-0}" "${memory_used:-0}" "${memory_total:-0}"
+  protocol_record display "${display:-unknown}"
+
+  count="${stats[net.count]:-0}"; [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  for ((index=0; index<count; index++)); do
+    protocol_record vm_net "${stats[net.$index.name]:-$index}" \
+      "${stats[net.$index.rx.bytes]:-0}" "${stats[net.$index.tx.bytes]:-0}"
+  done
+  count="${stats[block.count]:-0}"; [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  for ((index=0; index<count; index++)); do
+    protocol_record vm_block "${stats[block.$index.name]:-$index}" "${stats[block.$index.path]:-}" \
+      "${stats[block.$index.rd.bytes]:-0}" "${stats[block.$index.wr.bytes]:-0}"
+  done
+
+  for pci in "${GPU_PCI[@]}"; do
+    protocol_record gpu "$pci" "$(driver_for "$pci")" "$(iommu_group_for "$pci")" \
+      "$(pci_label "$pci")" "$(read_file "/sys/bus/pci/devices/$pci/vendor")"
+  done
+  if [[ "$(driver_for "${GPU_PCI[0]}")" == nvidia ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    IFS=, read -r temp util memory_used memory_total power < <(
+      timeout --signal=TERM --kill-after=2s "${NVIDIA_SMI_TIMEOUT}s" nvidia-smi \
+        --id="${GPU_PCI[0]}" --query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
+        --format=csv,noheader,nounits 2>/dev/null || true
+    )
+    protocol_record nvidia "$(trim_value "${temp:-}")" "$(trim_value "${util:-}")" \
+      "$(trim_value "${memory_used:-}")" "$(trim_value "${memory_total:-}")" "$(trim_value "${power:-}")"
+  fi
+  for item in "${VM_RAW_DISKS[@]}"; do machine_disk_record "$item"; done
+  for item in "${USB_DEVICES[@]}"; do
+    IFS='|' read -r label vid pid <<<"$item"
+    if usb_present "$vid" "$pid"; then present=yes; else present=no; fi
+    attached=no
+    if [[ "$state" == running ]] && (( $(usb_live_count "$vid" "$pid") > 0 )); then attached=yes; fi
+    protocol_record usb "$label" "$vid" "$pid" "$present" "$attached"
+  done
+}
+
+usb_is_configured() {
+  local want_vid="${1,,}" want_pid="${2,,}" item label vid pid
+  for item in "${USB_DEVICES[@]}"; do
+    IFS='|' read -r label vid pid <<<"$item"
+    [[ "${vid,,}" == "$want_vid" && "${pid,,}" == "$want_pid" ]] && return 0
+  done
+  return 1
+}
+
+machine_inventory() {
+  local selected_vm="${1:-${VM:-}}" output domain state dev bdf class group label persistent vendor
+  local primary companion item vid pid configured model cpu_count sockets cores threads vcpu cpuset
+  local seen_usb='|' config_exists=no
+  need virsh; need xmllint; need lspci; need lscpu
+  [[ -f "$CONFIG_FILE" ]] && config_exists=yes
+  if [[ -n "$selected_vm" ]]; then
+    virsh -c "$URI" dominfo "$selected_vm" >/dev/null 2>&1 || die "VM was not found at $URI: $selected_vm"
+    VM="$selected_vm"
+    VM_XML="$(virsh -c "$URI" dumpxml --inactive "$VM")" || die "could not read inactive XML for $VM"
+    discover_disks_from_vm
+  else
+    VM_XML=''
+    VM_RAW_DISKS=()
+  fi
+
+  protocol_begin
+  protocol_record inventory "$(date +%s)" "$selected_vm"
+  protocol_record config "$CONFIG_FILE" "$config_exists" "${VM:-}" "$URI"
+  output="$(virsh -c "$URI" list --all --name)" || die "could not list libvirt domains at $URI"
+  while IFS= read -r domain; do
+    [[ -n "$domain" ]] || continue
+    state="$(virsh -c "$URI" domstate "$domain" 2>/dev/null || true)"
+    protocol_record domain "$domain" "${state:-unknown}"
+  done <<<"$output"
+
+  model="$(awk -F: '/^(model name|Hardware)/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+  cpu_count="$(nproc 2>/dev/null || printf 0)"
+  sockets="$(lscpu | awk -F: '/^Socket\(s\):/ {gsub(/[ \t]/, "", $2); print $2; exit}')"
+  cores="$(lscpu | awk -F: '/^Core\(s\) per socket:/ {gsub(/[ \t]/, "", $2); print $2; exit}')"
+  threads="$(lscpu | awk -F: '/^Thread\(s\) per core:/ {gsub(/[ \t]/, "", $2); print $2; exit}')"
+  protocol_record cpu "$model" "$cpu_count" "${sockets:-0}" "${cores:-0}" "${threads:-0}"
+
+  for dev in /sys/bus/pci/devices/*; do
+    class="$(read_file "$dev/class")"; [[ "$class" == 0x03* ]] || continue
+    bdf="$(basename "$dev")"; group="$(iommu_group_for "$bdf")"; label="$(pci_label "$bdf")"
+    if [[ -n "$VM_XML" ]] && vm_has_pci_hostdev "$bdf"; then persistent=yes; else persistent=no; fi
+    vendor="$(read_file "$dev/vendor")"
+    protocol_record gpu "$bdf" "$(driver_for "$bdf")" "$group" "$label" "$persistent" "$vendor"
+    primary="${bdf%.*}"
+    if [[ "$group" != none && -d "/sys/kernel/iommu_groups/$group/devices" ]]; then
+      for companion in "/sys/kernel/iommu_groups/$group/devices/$primary".*; do
+        [[ -e "$companion" ]] || continue
+        item="$(basename "$companion")"
+        if [[ -n "$VM_XML" ]] && vm_has_pci_hostdev "$item"; then persistent=yes; else persistent=no; fi
+        protocol_record companion "$bdf" "$item" "$(driver_for "$item")" "$group" \
+          "$(pci_label "$item")" "$persistent"
+      done
+    fi
+  done
+  for item in "${GPU_PCI[@]}"; do protocol_record selected_gpu "$item"; done
+
+  for dev in /sys/bus/usb/devices/*; do
+    [[ -r "$dev/idVendor" && -r "$dev/idProduct" ]] || continue
+    vid="$(<"$dev/idVendor")"; pid="$(<"$dev/idProduct")"; [[ "$vid" != 1d6b ]] || continue
+    [[ "$seen_usb" != *"|$vid:$pid|"* ]] || continue
+    seen_usb+="$vid:$pid|"; label="$(usb_label "$vid" "$pid")"
+    if usb_is_configured "$vid" "$pid"; then configured=yes; else configured=no; fi
+    protocol_record usb_inventory "$label" "$vid" "$pid" "$configured"
+  done
+  for item in "${USB_DEVICES[@]}"; do protocol_record selected_usb "$item"; done
+  for item in "${VM_RAW_DISKS[@]}"; do machine_disk_record "$item"; done
+
+  if [[ -n "$selected_vm" ]]; then
+    while read -r vcpu cpuset; do
+      [[ "$vcpu" =~ ^[0-9]+$ ]] || continue
+      protocol_record pin "$vcpu" "$cpuset"
+    done < <(virsh -c "$URI" vcpupin "$selected_vm" 2>/dev/null | awk 'NR > 2 {print $1, $2}')
+  fi
+  protocol_record timer ready_delay "$READY_DELAY"
+  protocol_record timer shutdown_timeout "$SHUTDOWN_TIMEOUT"
+  protocol_record timer reattach_timeout "$REATTACH_TIMEOUT"
+  protocol_record timer nvidia_smi_timeout "$NVIDIA_SMI_TIMEOUT"
+  protocol_record setting allow_gui "$ALLOW_GUI"
+}
+
+internal_configure() {
+  local selected_vm='' selected_gpu='' arg id vid pid label slot group dev seen_usb='|'
+  local -a selected_usb=()
+  while (($# > 0)); do
+    arg="$1"; shift
+    case "$arg" in
+      --vm) (($# > 0)) || die "--vm requires a value"; selected_vm="$1"; shift ;;
+      --gpu) (($# > 0)) || die "--gpu requires a value"; selected_gpu="${1,,}"; shift ;;
+      --usb) (($# > 0)) || die "--usb requires VID:PID"; selected_usb+=("${1,,}"); shift ;;
+      *) die "unknown internal configuration argument: $arg" ;;
+    esac
+  done
+  [[ -n "$selected_vm" && -n "$selected_gpu" ]] || die "internal configuration requires --vm and --gpu"
+  [[ "$selected_gpu" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || die "invalid GPU PCI address: $selected_gpu"
+  [[ -e "/sys/bus/pci/devices/$selected_gpu" ]] || die "GPU PCI function is missing: $selected_gpu"
+  [[ "$(read_file "/sys/bus/pci/devices/$selected_gpu/class")" == 0x03* ]] || die "selected PCI function is not a display GPU: $selected_gpu"
+  VM="$selected_vm"; virsh -c "$URI" dominfo "$VM" >/dev/null 2>&1 || die "VM was not found at $URI: $VM"
+  VM_XML="$(virsh -c "$URI" dumpxml --inactive "$VM")" || die "could not read inactive XML for $VM"
+  GPU_PCI=(); slot="${selected_gpu%.*}"; group="$(readlink -f "/sys/bus/pci/devices/$selected_gpu/iommu_group" 2>/dev/null || true)"
+  if [[ -d "$group/devices" ]]; then
+    for dev in "$group/devices/$slot".*; do [[ -e "$dev" ]] && GPU_PCI+=("$(basename "$dev")"); done
+  fi
+  ((${#GPU_PCI[@]} > 0)) || GPU_PCI=("$selected_gpu")
+  GPU_MODULES=(); infer_gpu_modules
+  WIN_DISK=''; discover_disks_from_vm; WIN_DISK="${VM_RAW_DISKS[0]:-}"
+  USB_DEVICES=()
+  for id in "${selected_usb[@]}"; do
+    [[ "$id" =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]] || die "invalid USB VID:PID: $id"
+    [[ "$seen_usb" != *"|$id|"* ]] || continue
+    seen_usb+="$id|"
+    vid="${id%:*}"; pid="${id#*:}"; usb_present "$vid" "$pid" || die "selected USB device is not connected: $id"
+    label="$(usb_label "$vid" "$pid")"; label="${label//$'\n'/ }"; label="${label//|//}"
+    USB_DEVICES+=("$label|$vid|$pid")
+  done
+  USB_AUTO_DISCOVER=0
+  write_config >/dev/null
+  protocol_begin
+  protocol_record configured "$CONFIG_FILE" "$VM" "${GPU_PCI[*]}" "${#USB_DEVICES[@]}"
+}
+
 choose_one() {
   local prompt="$1"; shift; local -a choices=("$@"); local answer index
   ((${#choices[@]} > 0)) || die "no choices available for $prompt"
@@ -680,7 +942,7 @@ choose_one() {
   done
 }
 
-write_config() {
+_write_config() {
   local tmp item
   tmp="$(mktemp "$ROOT/.vm-helper.env.XXXXXX")"; TEMP_FILES+=("$tmp")
   {
@@ -697,6 +959,8 @@ write_config() {
   chmod 600 "$CONFIG_FILE"
   log "wrote $CONFIG_FILE"
 }
+
+write_config() { with_mutation_lock _write_config; }
 
 configure_interactive() {
   local -a domains=() labels=() bdfs=() usb_items=() usb_labels=()
@@ -764,19 +1028,87 @@ configure_interactive() {
   write_config
 }
 
+write_worker_metadata() {
+  local path="$1" token="$2" pid="$3" action="$4" status="$5" started="$6" finished="$7" rc="$8" log_path="$9"
+  local tmp="$path.tmp.$$"
+  umask 077
+  {
+    protocol_begin
+    protocol_record action "$token" "$pid" "$action" "$status" "$started" "$finished" "$rc" "$log_path"
+  } >"$tmp"
+  chmod 600 -- "$tmp"
+  mv -f -- "$tmp" "$path"
+}
+
+worker_finish() {
+  local rc="$1" status=failed
+  ((rc == 0)) && status=complete
+  cleanup
+  write_worker_metadata "$WORKER_META" "$WORKER_TOKEN" "$$" "$WORKER_ACTION" "$status" \
+    "$WORKER_STARTED" "$(date +%s)" "$rc" "$WORKER_LOG"
+}
+
+worker_run() {
+  local token="$1" action="$2" dir
+  [[ "$token" =~ ^[0-9A-Za-z._-]+$ ]] || die "invalid worker token"
+  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|check) ;; *) die "invalid worker action: $action" ;; esac
+  dir="$(ensure_runtime_dir)"
+  WORKER_TOKEN="$token"; WORKER_ACTION="$action"; WORKER_STARTED="$(date +%s)"
+  WORKER_LOG="$dir/action-$token.log"; WORKER_META="$dir/action-$token.meta"
+  write_worker_metadata "$WORKER_META" "$WORKER_TOKEN" "$$" "$WORKER_ACTION" running \
+    "$WORKER_STARTED" '' '' "$WORKER_LOG"
+  trap 'worker_finish $?' EXIT
+  case "$action" in
+    linux) return_linux_mode ;;
+    windows) start_windows_mode ;;
+    linux-windows) start_coexist_mode ;;
+    usb-attach) usb_action attach ;;
+    usb-detach) usb_action detach ;;
+    check) preflight_report ;;
+  esac
+}
+
+worker_start() {
+  local action="$1" dir token log_path meta_path pid
+  case "$action" in linux|windows|linux-windows|usb-attach|usb-detach|check) ;; *) die "invalid worker action: $action" ;; esac
+  need nohup; need setsid
+  dir="$(ensure_runtime_dir)"; token="$(date +%Y%m%d%H%M%S)-$$-$RANDOM"
+  log_path="$dir/action-$token.log"; meta_path="$dir/action-$token.meta"
+  umask 077; : >"$log_path"; chmod 600 -- "$log_path"
+  nohup setsid "$SCRIPT_PATH" __worker-run "$token" "$action" </dev/null >>"$log_path" 2>&1 &
+  pid=$!
+  write_worker_metadata "$meta_path" "$token" "$pid" "$action" running "$(date +%s)" '' '' "$log_path"
+  protocol_begin
+  protocol_record worker "$token" "$pid" "$action" "$log_path" "$meta_path"
+}
+
+tui_available() {
+  [[ "${VM_HELPER_TUI:-1}" != 0 && "${TERM:-dumb}" != dumb && -t 0 && -t 1 ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'import curses; curses.setupterm()' >/dev/null 2>&1
+}
+
+launch_tui() {
+  local mode="${1:-dashboard}"
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m vm_helper_tui \
+    --backend "$SCRIPT_PATH" --mode "$mode"
+}
+
 usage() {
   cat <<EOF
 Usage: $(basename "$SCRIPT_PATH") [command]
 
 Commands:
-  menu                 Interactive menu (default on a terminal)
+  menu                 Monitoring TUI (default on a terminal)
+  classic-menu         Classic Bash menu fallback
   linux                Host owns selected devices; start Linux desktop
   windows              Start Windows VM with selected devices; leave Linux at TTY
   linux-windows        Start Windows VM, then start Linux desktop
   status               VM, GPU, USB, disk, CPU topology and vCPU pinning
   check                Read-only transition preflight
   hardware             Discover host CPU, GPUs, IOMMU groups, disks and USB
-  configure            Interactive machine-local configuration wizard
+  configure            Full-screen machine-local configuration wizard
+  configure-classic    Classic Bash configuration wizard fallback
   usb status           Show configured USB and live VM USB state
   usb xml              Print generated USB hostdev XML without changing state
   usb attach           Live-attach configured USB devices
@@ -785,6 +1117,7 @@ Commands:
 
 Aliases: coexist and both mean linux-windows. Legacy entrypoints windows4090,
 linux4090, linux-vm, linuxvm, usb-vm-helper and vm-gpu-manager resolve here.
+Set VM_HELPER_TUI=0 to use classic Bash interaction by default.
 EOF
 }
 
@@ -907,15 +1240,33 @@ dispatch() {
   esac
   if [[ -z "$command" ]]; then [[ -t 0 ]] && command=menu || command=help; fi
   case "$command" in
-    menu) interactive_menu ;;
+    menu)
+      if tui_available; then launch_tui dashboard
+      else warn 'curses TUI unavailable; using the classic Bash menu'; interactive_menu; fi
+      ;;
+    classic-menu) interactive_menu ;;
     status) status_report ;;
     check|preflight) preflight_report ;;
     hardware|discover) hardware_report ;;
-    configure|config) configure_interactive ;;
+    configure|config)
+      if tui_available; then launch_tui configure
+      else warn 'curses TUI unavailable; using the classic Bash wizard'; configure_interactive; fi
+      ;;
+    configure-classic) configure_interactive ;;
     windows|vm) start_windows_mode ;;
     linux-windows|coexist|both|linux-vm) start_coexist_mode ;;
     linux|host) return_linux_mode ;;
     usb) usb_action "${2:-status}" ;;
+    machine)
+      case "${2:-}" in
+        snapshot) machine_snapshot ;;
+        inventory) machine_inventory "${3:-}" ;;
+        configure) shift 2; internal_configure "$@" ;;
+        worker-start) [[ -n "${3:-}" ]] || die 'worker-start requires an action'; worker_start "$3" ;;
+        *) die "unknown machine endpoint: ${2:-}" ;;
+      esac
+      ;;
+    __worker-run) [[ -n "${2:-}" && -n "${3:-}" ]] || die 'invalid worker invocation'; worker_run "$2" "$3" ;;
     help|-h|--help) usage ;;
     *) usage >&2; die "unknown command: $command" ;;
   esac

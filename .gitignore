@@ -16,6 +16,8 @@ vm-helper.env.bak.*
 *.sfdisk
 *.sock
 *.pid
+__pycache__/
+*.pyc
 
 # Local AI/session context
 project-memory.md
